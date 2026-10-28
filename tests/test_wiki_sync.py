@@ -256,5 +256,59 @@ class RoundTrip(SyncCase):
         self.assertIn("Parts are owner's", self.read(rel))
 
 
+
+class Edges(SyncCase):
+    """What the round trip must survive: links with no alias, code fences, an empty frontmatter."""
+
+    REL = "wiki/monorepo/rendering/linked.md"
+
+    def note(self, body, rel=REL, props="wiki: topic\n"):
+        return self.write(rel, f"---\n{props}---\n# Linked\n\n{body}").read_text()
+
+    def round_trip(self, rel=REL):
+        self.merge_dump()
+        (self.vault / rel).unlink()
+        self.assertIn("1 imported", self.sb("wiki", "import", str(self.clone)).stdout)
+        return self.read(rel)
+
+    def test_a_link_with_no_alias_or_to_a_section_takes_the_heading(self):
+        self.note("See [[wiki/monorepo/rendering/meshproxy]] and [[wiki/monorepo/rendering/meshproxy#Overview]].\n")
+        self.dump()
+        self.assertIn("See [MeshProxy](meshproxy.md) and [MeshProxy](meshproxy.md#Overview).",
+                      (self.clone / self.REL).read_text())
+        self.assertIn("See [[wiki/monorepo/rendering/meshproxy|MeshProxy]] and "
+                      "[[wiki/monorepo/rendering/meshproxy#Overview|MeshProxy]].", self.round_trip())
+
+    def test_leak_gate_reads_the_notes_as_converted(self):
+        self.git("config", "--add", "sb.leak", "Codename")
+        self.write("wiki/sk4te/x/plan.md", "---\nwiki: topic\n---\n# Codename Falcon\n")  # not dumped
+        self.note("See [[wiki/sk4te/x/plan]].\n")
+        r = self.dump(ok=False)
+        self.assertIn("leak gate", r.stdout + r.stderr)
+        self.assertIn(f"{self.REL}:6: See [Codename Falcon]", r.stdout + r.stderr)
+        self.assertEqual(self.git("branch", "--show-current").strip(), "main")
+
+    def test_links_in_tilde_and_long_fences_and_double_backticks_cross_unchanged(self):
+        code = ("~~~\n[[wiki/monorepo/rendering/meshproxy|M]] [M](meshproxy.md)\n~~~\n\n"
+                "````md\n```\n[[wiki/monorepo/rendering/meshproxy|M]] [M](meshproxy.md)\n```\n````\n\n"
+                "Inline ``[[wiki/monorepo/rendering/meshproxy|M]] ` [M](meshproxy.md)`` too.\n")
+        want = self.note(code + "Out: [[wiki/monorepo/rendering/meshproxy|MeshProxy]].\n")
+        self.dump()
+        self.assertEqual((self.clone / self.REL).read_text(), want.replace(
+            "Out: [[wiki/monorepo/rendering/meshproxy|MeshProxy]]", "Out: [MeshProxy](meshproxy.md)"))
+        self.assertEqual(self.round_trip(), want)
+
+    def test_an_empty_frontmatter_takes_back_the_vault_only_property(self):
+        tickets = 'tickets:\n  - "[[wayfinder/monorepo/x/issues/001-a|#001]]"\n'
+        want = self.note("Text.\n", props=tickets)
+        self.dump()
+        self.assertEqual((self.clone / self.REL).read_text(), "---\n---\n# Linked\n\nText.\n")
+        self.merge_dump()
+        self.sb("wiki", "import", str(self.clone))
+        self.teammate_edit(self.REL, "---\n---\n# Linked\n\nEdited.\n")
+        self.assertIn("1 imported", self.sb("wiki", "import", str(self.clone)).stdout)
+        self.assertEqual(self.read(self.REL), want.replace("Text.", "Edited."))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -87,6 +87,7 @@ MD_LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)")
 MD_FULL = re.compile(r"(!?)\[([^\]]*)\]\(([^)\s]+)\)")
 SCHEME = re.compile(r"[a-z][a-z0-9+.-]*:", re.I)
 CACHE = Path(os.environ.get("WIKIBRAIN_CACHE") or Path.home() / ".cache" / "wikibrain")
+CACHE_V = hashlib.sha1(Path(__file__).read_bytes() + Path(sb.__file__).read_bytes()).hexdigest()[:16]
 
 
 def wiki_dir():
@@ -104,6 +105,7 @@ def die(msg):
 # ---- the graph cache ------------------------------------------------------
 # One JSON file per wiki root in CACHE: for each note read, its properties, body and edges, stamped
 # with the file's mtime and size. A read stats the file and parses it only when the stamp moved.
+# The cache's version is a hash of the parsing code (this file and vault.py): a code change rebuilds.
 # ponytail: a same-size edit inside the filesystem's timestamp tick goes unseen; delete the file to rebuild.
 
 _graph, _dirty = None, False
@@ -133,7 +135,7 @@ def graph_entry(path):
     if _graph is None:
         try:
             d = json.loads(cache_file().read_text(encoding="utf-8"))
-            _graph = d["notes"] if d["v"] == 1 and isinstance(d["notes"], dict) else {}
+            _graph = d["notes"] if d["v"] == CACHE_V and isinstance(d["notes"], dict) else {}
         except (OSError, ValueError, KeyError, TypeError):
             _graph = {}
     st = path.stat()
@@ -152,7 +154,7 @@ def save_graph():
         try:
             CACHE.mkdir(parents=True, exist_ok=True)
             live = {k: v for k, v in _graph.items() if os.path.exists(k)}
-            sb.write_atomic(cache_file(), json.dumps({"v": 1, "notes": live}))
+            sb.write_atomic(cache_file(), json.dumps({"v": CACHE_V, "notes": live}))
         except OSError:
             pass  # ponytail: the cache is best-effort; an unwritable one costs a re-read next time
 
@@ -799,19 +801,31 @@ def gh(*a):
     return json.loads(r.stdout)
 
 
+BOT_SECTION = re.compile(r"<!--\s*this is an auto-generated (.*?)\s*-->.*?<!--\s*end of auto-generated \1\s*-->", re.S | re.I)
+MENTION = re.compile(r"(?<![\w@])@[A-Za-z0-9-]+(?![\w/])")
+
+
+def scrub(t):
+    """A PR text without what names people: bot sections between their markers, HTML comments
+    (an unclosed one to the end, as GitHub hides it) and `@login` mentions (`@someone`); an email
+    or a scoped package (`@scope/pkg`) stays."""
+    t = re.sub(r"<!--.*?(?:-->|\Z)", "", BOT_SECTION.sub("", t), flags=re.S)
+    return MENTION.sub("@someone", t)
+
+
 def read_pr(repo, num, only):
     """A pull request as a raw note: its description, then the human discussion in order (comments,
-    reviews with a body, inline review comments led by their file); no names, no bots. Merged: the
+    reviews with a body, inline review comments led by their file); no names, no bots (`scrub`). Merged: the
     merge commit on the base branch; else the head commit on its branch. Paths: the changed files
     the PR did not delete, narrowed to `only` (files or folders; one that matches nothing is an error)."""
     pr = gh("pr", "view", f"https://github.com/{repo}/pull/{num}", "--json",
             "title,body,mergeCommit,headRefName,headRefOid,baseRefName,files,createdAt,mergedAt")
-    parts = [pr.get("body") or ""]
+    parts = [scrub(pr.get("body") or "")]
     for kind in ("issues/%s/comments", "pulls/%s/reviews", "pulls/%s/comments"):
         for c in (x for page in gh("api", f"repos/{repo}/{kind % num}", "--paginate", "--slurp") for x in page):
-            u = c.get("user") or {}
-            if u.get("type") != "Bot" and not u.get("login", "").endswith("[bot]"):
-                parts.append(f"{c['path']}: {c['body']}" if c.get("path") else c.get("body") or "")
+            u, body = c.get("user") or {}, scrub(c.get("body") or "")
+            if body.strip() and u.get("type") != "Bot" and not u.get("login", "").endswith("[bot]"):
+                parts.append(f"{c['path']}: {body}" if c.get("path") else body)
     files = [f["path"] for f in pr["files"] if f.get("changeType") != "DELETED"]
     if only:
         for o in only:
@@ -921,7 +935,7 @@ def repo_checker(root, base):
         return sorted(paths), sorted(names)
 
     def check(n):
-        mine = [x for x in raw_sources(n) if x.props.get("repo") == repo and SHA.fullmatch(str(x.props.get("commit", "")))]
+        mine = [x for x in raw_sources(n) if same_repo(x, repo) and SHA.fullmatch(str(x.props.get("commit", "")))]
         row = {"note": n.rel, "anchor": None, "ref": None, "target": None, "guessed": False,
                "paths": [], "symbols": [], "changed": [], "gone": [], "commits_since": 0}
         if mine:
@@ -962,12 +976,22 @@ def raw_sources(n):
     return [Note(p) for p in (target_of(entry_key(e)) for e in n.refs("sources")) if p and Note(p).kind == "raw"]
 
 
+def same_repo(raw, repo):
+    return str(raw.props.get("repo") or "").lower() == repo.lower()
+
+
+def repo_project(repo):
+    """The project folder named like the repo, in any case (HomeStudio, homestudio); else the repo's name."""
+    name = repo.split("/")[-1]
+    return next((p for p in projects() if p.lower() == name.lower()), name)
+
+
 def cmd_verify(args):
     """Are an article's claims about a repo still true? See `repo_checker`."""
     root = Path(sb.opt(args, "--repo-root", ".")).expanduser()
     base = sb.opt(args, "--base", "origin/main")
     repo, check = repo_checker(root, base)
-    project = sb.opt(args, "--project") or repo.split("/")[-1]
+    project = sb.opt(args, "--project") or repo_project(repo)
     rows = [check(n) for n in articles() if n.kind == "article" and project_of(n.path) == project]
     rows.sort(key=lambda r: (VERDICTS.index(r["verdict"]), r["note"]))
     if "--json" in args:
@@ -991,7 +1015,8 @@ def repo_path(p):
 
 
 def cmd_covers(args):
-    """The articles that rest on the given files or folders: an article's `paths`, else its sources'."""
+    """The articles that rest on the given files or folders: an article's `paths`, else its sources'
+    (with a clone, only the sources read from its repo)."""
     flags = ("--diff", "--repo-root", "--project", "--base")
     given = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] not in flags)]
     root, diff, base = sb.opt(args, "--repo-root"), sb.opt(args, "--diff"), sb.opt(args, "--base", "origin/main")
@@ -1007,12 +1032,13 @@ def cmd_covers(args):
         die("covers needs paths or --diff <base>")
     given = sorted({repo_path(p) for p in given})
     repo, check = repo_checker(Path(root).expanduser(), base) if root else (None, None)
-    project = sb.opt(args, "--project") or (repo and repo.split("/")[-1])
+    project = sb.opt(args, "--project") or (repo and repo_project(repo))
     rows = []
     for n in articles():
         if n.kind != "article" or not in_scope(n.path, project):
             continue
-        mine = {repo_path(p) for p in text_list(n, "paths") or [p for x in raw_sources(n) for p in text_list(x, "paths")]}
+        mine = {repo_path(p) for p in text_list(n, "paths") or
+                [p for x in raw_sources(n) if not repo or same_repo(x, repo) for p in text_list(x, "paths")]}
         if any(not p or not a or p == a or a.startswith(p + "/") or p.startswith(a + "/") for p in given for a in mine):
             rows.append({"note": n.rel, "verdict": check(n)["verdict"] if check else "-",
                          "summary": " ".join(str(n.props.get("summary", "")).split())})
@@ -1328,7 +1354,11 @@ def by_name(name):
     return [p for p in sb.VAULT.rglob(name) if not SKIP_DIRS & set(p.relative_to(sb.VAULT).parts)]
 
 
-CODE_SPAN = re.compile(r"```.*?```|`[^`\n]*`", re.S)
+# A fence of 3+ backticks or tildes (closed by a fence of the same character at least as long, or by
+# the end), then an inline span between equal backtick runs. ponytail: indented code blocks are prose.
+CODE_SPAN = re.compile(r"^ {0,3}(`{3,}(?=[^`\n]*$)|~{3,})[^\n]*(?:\n.*?)??"
+                       r"(?:\n {0,3}\1(?:(?<=`)`*|(?<=~)~*)[ \t]*(?=\n|\Z)|\Z)"
+                       r"|(?<!`)(`+)(?!`)[^\n]*?(?<!`)\2(?!`)", re.M | re.S)
 
 
 def outside_code(text, fn, keep_code=False):

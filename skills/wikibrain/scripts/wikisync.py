@@ -123,6 +123,8 @@ def data(text):
 
 def blocks(text):
     """([key, lines] per property, the text after the frontmatter); (None, text) without one."""
+    if text.startswith("---\n---\n"):
+        return [], text[4:]
     end = text.find("\n---\n", 4) if text.startswith("---\n") else -1
     if end < 0:
         return None, text
@@ -137,7 +139,7 @@ def blocks(text):
 
 
 def joined(fm, rest):
-    return rest if fm is None else "---\n" + "\n".join(line for _, lines in fm for line in lines) + "\n" + rest
+    return rest if fm is None else "---\n" + "".join(line + "\n" for _, lines in fm for line in lines) + rest
 
 
 def strip(text, only):
@@ -184,7 +186,7 @@ def source_text(rel):
     return rel.startswith("wiki/raw/")
 
 
-def to_repo(text, rel):
+def to_repo(note, rel):
     """The clone's form: body links relative to `rel`, link properties repo-root paths."""
     def prop(v):
         m = LINK.fullmatch(v.strip())
@@ -201,7 +203,7 @@ def to_repo(text, rel):
             alias = heading(text(p.read_bytes()) if p.is_file() else None, Path(target).name)
         return embed + sb.md_link(path, alias or "", rel, (anchor or "")[1:])
 
-    fm, rest = blocks(text)
+    fm, rest = blocks(note)
     ref_props(fm, prop)
     return joined(fm, rest if source_text(rel) else outside_code(rest, lambda seg: LINK.sub(link, seg), keep_code=True))
 
@@ -261,7 +263,9 @@ def cmd_dump(args):
     vault_files = s.files(sb.VAULT)
     gated = {rel: text(p.read_bytes()) for rel, p in vault_files.items()}
     gated = {rel: strip(t, s.vault_only) if rel.endswith(".md") else t for rel, t in gated.items()}
-    hits = s.leaked(gated)
+    out = {rel: data(to_repo(t, rel)) if rel.endswith(".md") else vault_files[rel].read_bytes()
+           for rel, t in gated.items()}
+    hits = s.leaked(gated) or s.leaked({rel: text(b) for rel, b in out.items()})  # an alias can bring a heading
     if hits:
         die("leak gate: these lines must not leave the vault\n  " + "\n  ".join(hits))
     start = base or git(s.clone, "rev-parse", "--verify", "--quiet", "HEAD", ok=False).stdout.strip()
@@ -271,8 +275,6 @@ def cmd_dump(args):
         branch, n = f"wiki-dump/{date.today().isoformat()}-{n}", n + 1
     git(s.clone, "switch", "-c", branch, *([start] if start else []))
     clone_files = s.files(s.clone)
-    out = {rel: data(to_repo(t, rel)) if rel.endswith(".md") else vault_files[rel].read_bytes()
-           for rel, t in gated.items()}
     changed = [rel for rel in vault_files if rel not in clone_files or clone_files[rel].read_bytes() != out[rel]]
     removed = [rel for rel in clone_files if rel not in vault_files] if last else []
     for rel in changed:

@@ -206,10 +206,25 @@ class Graph(Seeded):
 
     def test_a_corrupt_cache_rebuilds(self):
         want = self.sb("wiki", "index").stdout
+        v = json.loads(next(self.cache.glob("*.json")).read_text())["v"]
         for f in self.cache.glob("*.json"):
             f.write_text('{"v": 1, "notes": {"x"', encoding="utf-8")
         self.assertEqual(self.sb("wiki", "index").stdout, want)
-        self.assertEqual(json.loads(next(self.cache.glob("*.json")).read_text())["v"], 1)
+        self.assertEqual(json.loads(next(self.cache.glob("*.json")).read_text())["v"], v)
+
+    def test_a_cache_from_other_parsing_code_rebuilds(self):
+        self.sb("wiki", "index")
+        f = next(self.cache.glob("*.json"))
+        d = json.loads(f.read_text())
+        self.assertRegex(d["v"], r"^[0-9a-f]{16}$")  # a hash of wikibrain.py and vault.py
+        key = next(k for k in d["notes"] if k.endswith("frontmatter-links.md"))
+        d["notes"][key]["props"]["summary"] = "A stale parse."
+        f.write_text(json.dumps(d), encoding="utf-8")
+        self.assertIn("A stale parse.", self.sb("wiki", "index").stdout)  # same code: the cache is served
+        f.write_text(json.dumps({**d, "v": "0" * 16}), encoding="utf-8")
+        out = self.sb("wiki", "index").stdout
+        self.assertNotIn("A stale parse.", out)
+        self.assertIn("Property links lose their property name.", out)
 
     def test_wikilinks_and_relative_links_name_the_same_targets(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skills" / "wikibrain" / "scripts"))
@@ -310,12 +325,29 @@ class Provenance(Seeded):
                      f"commit: {'b' * 40}", "ref: main", "published: 2026-03-04",
                      "paths:\n  - libs/viewport/Render.ts\n  - apps/web/main.ts\n"):
             self.assertIn(line, text)
-        self.assertTrue(text.endswith("---\nSwitches the frameloop.\nSee @alice.\n\nWhy demand?\n\nLooks good."
+        self.assertTrue(text.endswith("---\nSwitches the frameloop.\nSee @someone.\n\nWhy demand?\n\nLooks good."
                                       "\n\nlibs/viewport/Render.ts: Name it.\n"), text)
-        for gone in ("bob", "Walkthrough", "Nit.", "coderabbit"):
+        for gone in ("alice", "bob", "Walkthrough", "Nit.", "coderabbit"):
             self.assertNotIn(gone, text)
         self.assertNotRegex(text, r"author: \S")
         self.assertIn("0 problem", self.sb("wiki", "check").stdout)
+
+    def test_raw_pr_drops_html_comments_bot_sections_and_mentions(self):
+        human = {"login": "bob", "type": "User"}
+        body = ("Fixes the loop. <!-- reviewer: @carol -->\n<!--\nmulti\n@dave\n-->\n"
+                "<!-- This is an auto-generated comment: release notes by coderabbit.ai -->\n## Summary by CodeRabbit\n"
+                "Thanks @erin\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->\n"
+                "cc @frank-2, (@gina) and @hal: mail ivan@example.com, add @types/node and @scope/pkg.\n")
+        self.fake_gh(self.pr(body=body), comments=[
+            {"user": human, "body": "<!-- This is an auto-generated reply by CodeRabbit -->\nBy @judy"
+                                    "\n<!-- end of auto-generated reply by CodeRabbit -->"},
+            {"user": human, "body": "Agreed with @kim. <!-- unclosed @lee"}])
+        text = self.read(self.sb("wiki", "raw", "monorepo/rendering", "--pr", self.PR).stdout.strip())
+        self.assertTrue(text.endswith("---\nFixes the loop. \n\n\ncc @someone, (@someone) and @someone: mail "
+                                      "ivan@example.com, add @types/node and @scope/pkg.\n\nAgreed with @someone.\n"),
+                        text)
+        for gone in ("@carol", "@dave", "@erin", "@frank", "@gina", "@hal", "@judy", "@kim", "@lee", "CodeRabbit", "<!--"):
+            self.assertNotIn(gone, text)
 
     def test_raw_pr_open_records_the_head_and_narrows_paths_to_a_folder(self):
         self.fake_gh(self.pr(mergeCommit=None, mergedAt=None))
@@ -477,6 +509,19 @@ class Verify(Seeded):
         self.assertEqual(self.covers("--diff", "origin/main", "libs/nothing"),
                          {"render-loop": "current", "own-paths": "unanchored"})
         self.sb("wiki", "covers", "--repo-root", str(self.clone), ok=False)
+
+    def test_covers_keeps_only_sources_from_the_clones_repo(self):
+        self.covered_articles()
+        self.add_article("elsewhere", "e" * 40)
+        self.sb("wiki", "set", "wiki/raw/monorepo/rendering/src-elsewhere", "repo=org/other")
+        self.assertEqual(self.covers("libs/viewport/Render.ts"), {"render-loop": "current"})
+        self.assertIn("elsewhere", self.sb("wiki", "covers", "libs/viewport/Render.ts").stdout)  # no clone: any repo
+
+    def test_the_default_project_and_the_sources_repo_match_the_repo_in_any_case(self):
+        self.covered_articles()
+        self.git(self.clone, "remote", "set-url", "origin", "git@github.com:Org/MonoRepo.git")
+        self.assertEqual(self.verdicts(), {"render-loop": "current", "own-paths": "unanchored"})
+        self.assertEqual(self.covers("libs/viewport/Render.ts"), {"render-loop": "current"})
 
     def test_covers_without_a_clone_has_no_verdict(self):
         self.covered_articles()
