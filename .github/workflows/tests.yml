@@ -1,0 +1,12 @@
+name: tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: git config --global user.email ci@example.com && git config --global user.name ci
+      - run: python3 -m unittest discover tests
