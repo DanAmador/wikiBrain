@@ -1,5 +1,5 @@
 """wikibrain: an LLM wiki's tools, `reference/wiki.md` made executable. Run as `wikibrain.py <command>`
-(a leading `wiki` is accepted, so `wikibrain <command>` delegates here unchanged).
+(a leading `wiki` is accepted, so the sb skill's `sbmap wiki <command>` delegates here unchanged).
 
   read
     wikibrain.py index [--project P] [--write]

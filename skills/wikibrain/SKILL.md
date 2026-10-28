@@ -20,7 +20,7 @@ No command lists them all. `SB_VAULT` is the vault root (an Obsidian vault or a 
 
 | | commands |
 |---|---|
-| read | `index`, `find`, `show`, `link`, `backlog`, `graph`, `verify` |
+| read | `index`, `find`, `show`, `link`, `backlog`, `verify` |
 | write | `init`, `raw`, `new`, `set`, `log`, `check [--fix]`, `migrate` |
 | sync | `dump <clone>`, `import <clone>`: chosen projects ↔ a shared git clone, byte for byte, by PR |
 
