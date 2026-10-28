@@ -260,6 +260,10 @@ read with `sbmap show`, as everywhere.
 - `--project <repo>` narrows a read to that project plus `general`: what one repo's work can use.
 - `<refs>` are comma-separated vault paths, wikilinks, or `<map>#<NNN>` for a ticket; wikibrain writes
   each as a full-path wikilink and refuses one that names no note.
+- Every command reads notes through a graph cache, one JSON file per wiki root in `~/.cache/wikibrain`
+  (`WIKIBRAIN_CACHE` moves it): each note's properties, body and edges (`sources`, `related`,
+  `supersedes`, `disputes`, `tickets`, `paths`, and body links, wikilink or relative alike), re-read
+  only when its mtime or size changes. Delete the file to rebuild; a corrupt one rebuilds itself.
 
 | command | does |
 |---|---|

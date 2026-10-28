@@ -112,10 +112,11 @@ def opt(args, name, default=None):
 class Ticket:
     """A tracker ticket cited as a source: its number, status and type, read from its properties."""
 
-    def __init__(self, path):
+    def __init__(self, path, note=None):
+        """`note`: the already-parsed note (anything with props and body), to spare a second read."""
         self.path = Path(path)
         self.num = int(re.match(r"(\d+)", self.path.name).group(1))
-        props, body, _ = split_fm(self.path.read_text(encoding="utf-8"))
+        props, body = (note.props, note.body) if note else split_fm(self.path.read_text(encoding="utf-8"))[:2]
         self.title = str(props.get("title") or (re.search(r"^# (.+)$", body, re.M) or [None, self.path.stem])[1]).strip()
         raw = str(props.get("status") or "open").lower()
         self.status = TICKET_STATUS.get(raw, raw)

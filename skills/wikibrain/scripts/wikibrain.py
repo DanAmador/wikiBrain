@@ -38,13 +38,17 @@
 holds outside any one repo. <note> is a vault path, `<project>/<topic>/<slug>` or a wikilink. <refs> are comma-separated vault paths,
 wikilinks, or `<map>#<NNN>` for a ticket; each is written as a full-path wikilink.
 """
+import copy
 import functools
+import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
 from datetime import date
 from pathlib import Path
+from urllib.parse import unquote
 
 import vault as sb
 
@@ -60,6 +64,7 @@ TYPES = {"article": {"concept", "entity"}, "synthesis": {"synthesis"}, "raw": {"
          "topic": {"topic"}}
 STATUSES = ("current", "outdated", "disputed")
 REF_KEYS = ("sources", "related", "supersedes", "superseded_by", "disputes")
+EDGE_KEYS = REF_KEYS + ("tickets", "paths")
 RECIPROCAL = {"disputes": "disputes", "supersedes": "superseded_by", "superseded_by": "supersedes"}
 DATE_KEYS = ("updated", "reviewed", "archived", "created", "published")
 ROOT_FILES = ("index.md", "log.md", "README.md")
@@ -70,6 +75,9 @@ DATED = re.compile(r"\d+-")
 DISPUTED = re.compile(r"^> \[!question\] Disputed", re.M)
 OUTDATED = re.compile(r"^> \[!warning\] Outdated\b(.*)$", re.M)
 LINK = re.compile(r"(!?)\[\[([^\]|#]*)(#[^\]|]*)?(?:\|([^\]]*))?\]\]")
+MD_LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)")
+SCHEME = re.compile(r"[a-z][a-z0-9+.-]*:", re.I)
+CACHE = Path(os.environ.get("WIKIBRAIN_CACHE") or Path.home() / ".cache" / "wikibrain")
 
 
 def wiki_dir():
@@ -84,13 +92,69 @@ def die(msg):
     sys.exit(f"wikibrain: {msg}")
 
 
+# ---- the graph cache ------------------------------------------------------
+# One JSON file per wiki root in CACHE: for each note read, its properties, body and edges, stamped
+# with the file's mtime and size. A read stats the file and parses it only when the stamp moved.
+# ponytail: a same-size edit inside the filesystem's timestamp tick goes unseen; delete the file to rebuild.
+
+_graph, _dirty = None, False
+
+
+def edges(props, body, rel):
+    """[[kind, target]] a note points at: its list properties, then its body links, wikilinks and
+    relative links alike, each target a vault-relative path without `.md` (a `paths` entry as written)."""
+    out = []
+    for k in EDGE_KEYS:
+        v = props.get(k) or []
+        out += [(k, str(e) if k == "paths" else entry_key(e)) for e in (v if isinstance(v, list) else [v])]
+    out += [("link", entry_key(m.group(2))) for m in LINK.finditer(body) if m.group(2).strip()]
+    for t in MD_LINK.findall(body):  # ponytail: links inside code fences count too
+        t = unquote(re.split(r"[#?]", t)[0])
+        if t and not SCHEME.match(t):
+            out.append(("link", entry_key(os.path.normpath(os.path.join(os.path.dirname(rel), t)))))
+    return [list(e) for e in dict.fromkeys(out)]
+
+
+def cache_file():
+    return CACHE / (hashlib.sha1(str(sb.VAULT.resolve()).encode()).hexdigest()[:16] + ".json")
+
+
+def graph_entry(path):
+    global _graph, _dirty
+    if _graph is None:
+        try:
+            d = json.loads(cache_file().read_text(encoding="utf-8"))
+            _graph = d["notes"] if d["v"] == 1 and isinstance(d["notes"], dict) else {}
+        except (OSError, ValueError, KeyError, TypeError):
+            _graph = {}
+    st = path.stat()
+    stamp, e = [st.st_mtime_ns, st.st_size], _graph.get(str(path))
+    if isinstance(e, dict) and e.get("stamp") == stamp and {"props", "body", "fm", "edges"} <= e.keys():
+        return e
+    props, body, fm = sb.split_fm(path.read_text(encoding="utf-8"))
+    _graph[str(path)] = e = {"stamp": stamp, "props": props, "body": body, "fm": fm,
+                             "edges": edges(props, body, sb.rel(path))}
+    _dirty = True
+    return e
+
+
+def save_graph():
+    if _dirty:
+        try:
+            CACHE.mkdir(parents=True, exist_ok=True)
+            live = {k: v for k, v in _graph.items() if os.path.exists(k)}
+            sb.write_atomic(cache_file(), json.dumps({"v": 1, "notes": live}))
+        except OSError:
+            pass  # ponytail: the cache is best-effort; an unwritable one costs a re-read next time
+
+
 # ---- notes ----------------------------------------------------------------
 
 class Note:
     def __init__(self, path):
         self.path = Path(path)
-        self.text = self.path.read_text(encoding="utf-8")
-        self.props, self.body, self.has_fm = sb.split_fm(self.text)
+        e = graph_entry(self.path)
+        self.props, self.body, self.has_fm, self.edges = copy.deepcopy(e["props"]), e["body"], e["fm"], e["edges"]
         self.kind = str(self.props.get("wiki", ""))
 
     @property
@@ -114,8 +178,7 @@ class Note:
             self.props = props
         if body is not None:
             self.body = body
-        self.text = sb.dump_fm(self.props, WIKI_KEYS) + self.body.lstrip("\n")
-        sb.write_atomic(self.path, self.text)
+        sb.write_atomic(self.path, sb.dump_fm(self.props, WIKI_KEYS) + self.body.lstrip("\n"))
 
 
 def target_of(target):
@@ -128,6 +191,10 @@ def target_of(target):
         return p
     q = p.with_name(p.name + ".md")
     return q if q.is_file() else None
+
+
+def ticket(path):
+    return sb.Ticket(path, Note(path))
 
 
 def link_path(ref):
@@ -163,7 +230,7 @@ def resolve_ref(ref):
     if p is None:
         die(f"'{ref}' names no note")
     if "/wayfinder/" in "/" + sb.rel(p) and re.match(r"\d+[- ]", p.name) and p.parent.name == "issues":
-        t = sb.Ticket(p)
+        t = ticket(p)
         return p, t.link("#" + t.id)
     return p, Note(p).link()
 
@@ -227,7 +294,7 @@ def source_problem(kind, path):
         if kind == "synthesis" and Note(path).kind == "article":
             return None
         return f"{sb.rel(path)[:-3]} is not a raw note" + (" or an article" if kind == "synthesis" else "")
-    if cls == "ticket" and sb.Ticket(path).status != "resolved":
+    if cls == "ticket" and ticket(path).status != "resolved":
         return f"{sb.rel(path)[:-3]} is a ticket that is not resolved"
     return None
 
@@ -617,14 +684,14 @@ def raw_notes():
     for folder in (wiki_dir() / "raw", sb.VAULT / "Clippings", sb.WAYFINDER):
         if folder.is_dir():
             out += [p for p in sorted(folder.rglob("*.md")) if "backups" not in p.parts
-                    and raw_class(p) and (raw_class(p) != "ticket" or sb.Ticket(p).status == "resolved")]
+                    and raw_class(p) and (raw_class(p) != "ticket" or ticket(p).status == "resolved")]
     return out
 
 
 def describe(path):
     """(type, status, summary) for one line of output."""
     if raw_class(path) == "ticket":
-        t = sb.Ticket(path)
+        t = ticket(path)
         return t.type + " ticket", t.status, t.title
     n = Note(path)
     if raw_class(path):
@@ -968,14 +1035,14 @@ def cmd_log(args):
 
 def cited():
     """Every note some article or synthesis page names in `sources`."""
-    return {entry_key(e) for n in articles() for e in n.refs("sources")}
+    return {dst for n in articles() for kind, dst in n.edges if kind == "sources"}
 
 
 def no_material():
     p = wiki_dir() / "log.md"
     if not p.exists():
         return set()
-    found = re.findall(r"^## \[[^\]]*\] learn \| no material: (.+?)\s*$", p.read_text(encoding="utf-8"), re.M)
+    found = re.findall(r"^## \[[^\]]*\] learn \| no material: (.+?)\s*$", Note(p).body, re.M)
     return {entry_key(f) for f in found}
 
 
@@ -984,7 +1051,7 @@ def backlog(project=None):
     out = []
     for p in raw_notes():
         key = sb.rel(p)[:-3]
-        if key in done or not in_scope(p, project) or (raw_class(p) == "ticket" and sb.Ticket(p).type != "research"):
+        if key in done or not in_scope(p, project) or (raw_class(p) == "ticket" and ticket(p).type != "research"):
             continue
         created = str(Note(p).props.get("created") or date.fromtimestamp(p.stat().st_mtime).isoformat())
         out.append((created[:10], key, p))
@@ -1421,7 +1488,10 @@ def main(args):
         args = args[1:]
     if not args or args[0] not in COMMANDS:
         sys.exit(__doc__)
-    COMMANDS[args[0]](args[1:])
+    try:
+        COMMANDS[args[0]](args[1:])
+    finally:
+        save_graph()
 
 
 if __name__ == "__main__":

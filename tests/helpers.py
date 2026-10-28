@@ -16,6 +16,7 @@ class VaultCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.vault = Path(self._tmp.name) / "Vault"
         self.vault.mkdir()
+        self.cache = Path(self._tmp.name) / "cache"
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -23,7 +24,8 @@ class VaultCase(unittest.TestCase):
     def sb(self, *args, stdin=None, ok=True):
         """Run sbmap; ok=True asserts exit 0, ok=False asserts non-zero, ok=None asserts nothing."""
         # PATH without /usr/local/bin keeps the real Obsidian CLI out of the tests
-        env = {**os.environ, "SB_VAULT": str(self.vault), "PATH": "/usr/bin:/bin"}
+        env = {**os.environ, "SB_VAULT": str(self.vault),
+               "WIKIBRAIN_CACHE": str(self.cache), "PATH": "/usr/bin:/bin"}
         r = subprocess.run([sys.executable, str(SBMAP), *args], capture_output=True, text=True,
                            env=env, input=stdin, cwd=self.vault)
         if ok is True:

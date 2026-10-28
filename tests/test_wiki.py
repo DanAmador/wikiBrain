@@ -1,5 +1,7 @@
 import json
+import os
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -160,6 +162,70 @@ class Read(Seeded):
         self.assertIn("wayfinder/m/one/research/notes", out)
         self.assertIn("wayfinder/m/one/issues/001-zebra-ticket", out)
         self.assertNotIn("002-zebra-open", out)
+
+
+class Graph(Seeded):
+    """The cached graph index behind index, find, show and backlog."""
+
+    READS = (("index",), ("find", "links", "--raw"), ("show", "general/obsidian/frontmatter-links", "--full"),
+             ("backlog",))
+
+    def setUp(self):
+        super().setUp()
+        self.write("Clippings/Page.md", "---\ncreated: 2026-02-01\n---\nlinks everywhere\n")
+        self.map("m/one")
+        self.ticket("m/one", 1, "Links research")
+
+    def notes(self):
+        return [p for p in self.vault.rglob("*.md")]
+
+    def test_a_second_read_touches_no_note_file_and_prints_the_same(self):
+        first = [self.sb("wiki", *a).stdout for a in self.READS]
+        self.assertEqual(len(list(self.cache.glob("*.json"))), 1)
+        notes = self.notes()
+        try:
+            for p in notes:
+                p.chmod(0)
+            if os.access(notes[0], os.R_OK):
+                self.skipTest("file modes do not bind this user")
+            second = [self.sb("wiki", *a).stdout for a in self.READS]
+        finally:
+            for p in notes:
+                p.chmod(0o644)
+        self.assertEqual(first, second)
+
+    def test_an_edited_note_is_read_again(self):
+        self.sb("wiki", "index")
+        p = self.vault / self.article
+        p.write_text(p.read_text(encoding="utf-8").replace("lose their property name", "keep their name"),
+                     encoding="utf-8")
+        st = p.stat()
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 10**10))
+        self.assertIn("Property links keep their name.", self.sb("wiki", "index").stdout)
+        self.assertIn("keep their name", self.sb("wiki", "find", "keep").stdout)
+
+    def test_a_corrupt_cache_rebuilds(self):
+        want = self.sb("wiki", "index").stdout
+        for f in self.cache.glob("*.json"):
+            f.write_text('{"v": 1, "notes": {"x"', encoding="utf-8")
+        self.assertEqual(self.sb("wiki", "index").stdout, want)
+        self.assertEqual(json.loads(next(self.cache.glob("*.json")).read_text())["v"], 1)
+
+    def test_wikilinks_and_relative_links_name_the_same_targets(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skills" / "wikibrain" / "scripts"))
+        import wikibrain
+        props = {"sources": ["[[wiki/raw/p/t/x|X]]"], "tickets": ["[[wayfinder/m/one/issues/001-a|#001]]"],
+                 "related": ["wiki/p/t/b.md"], "paths": ["src/a.md"]}
+        vault = wikibrain.edges(props, "See [[wiki/p/u/c|C]] and [[wiki/p/u/c#Part|C]].", "wiki/p/t/a.md")
+        clone = wikibrain.edges(props, "See [C](../u/c.md) and [C](../u/c.md#part), [site](https://x.org/c.md).",
+                                "wiki/p/t/a.md")
+        self.assertEqual(vault, clone)
+        self.assertIn(["link", "wiki/p/u/c"], vault)
+        self.assertIn(["sources", "wiki/raw/p/t/x"], vault)
+        self.assertIn(["related", "wiki/p/t/b"], vault)
+        self.assertIn(["tickets", "wayfinder/m/one/issues/001-a"], vault)
+        self.assertIn(["paths", "src/a.md"], vault)
+        self.assertEqual(len(vault), 5)
 
 
 class Raw(Seeded):
