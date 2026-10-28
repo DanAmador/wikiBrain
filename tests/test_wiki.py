@@ -567,7 +567,23 @@ class Check(Seeded):
                       "bare #123", "broken link: [[wiki/nowhere|x]]")
 
     def test_links_inside_code_are_text(self):
-        self.append(self.article, "\nSee [[wiki/general/obsidian/obsidian|the topic]]. Write `[[mine]]` or `#123`, never bare.\n\n```\n[[other]] #456\n```\n")
+        self.append(self.article, "\nSee [[wiki/general/obsidian/obsidian|Obsidian]]. Write `[[mine]]` or `#123`, never bare.\n\n```\n[[other]] #456\n```\n")
+        self.sb("wiki", "check")
+
+    def test_an_alias_must_be_the_targets_heading_and_fix_writes_it(self):
+        text = self.read(self.article).replace("|Link cache]]", "|The cache]]")
+        self.write(self.article, text + "\nSee [[wiki/general/obsidian/obsidian|the topic]], "
+                   "[[wiki/general/obsidian/obsidian#Part|a part]] and [[wiki/general/obsidian/obsidian]].\n")
+        out = self.problems(
+            "alias is not the target's heading: [[wiki/raw/general/obsidian/link-cache|The cache]] (heading: Link cache)",
+            "alias is not the target's heading: [[wiki/general/obsidian/obsidian|the topic]] (heading: Obsidian)",
+            "alias is not the target's heading: [[wiki/general/obsidian/obsidian]] (heading: Obsidian)")
+        self.assertNotIn("a part", out)
+        self.sb("wiki", "check", "--fix")
+        text = self.read(self.article)
+        self.assertIn('"[[wiki/raw/general/obsidian/link-cache|Link cache]]"', text)
+        self.assertIn("See [[wiki/general/obsidian/obsidian|Obsidian]], [[wiki/general/obsidian/obsidian#Part|a part]] "
+                      "and [[wiki/general/obsidian/obsidian|Obsidian]].", text)
         self.sb("wiki", "check")
 
     def test_grounding_suspects_are_printed_and_never_counted(self):
@@ -578,6 +594,65 @@ class Check(Seeded):
         self.assertIn("A quote that no source holds at all", suspects)
         self.assertNotIn("42K", suspects)
         self.assertIn("on the backlog", out)
+
+
+class RelativeStore(VaultCase):
+    """A sync clone (`sb.projects` set, or `sb.links relative`) writes the links GitHub renders."""
+
+    def setUp(self):
+        super().setUp()
+        subprocess.run(["git", "init", "-q", str(self.vault)], check=True)
+        self.config("sb.projects", "general")
+        self.sb("wiki", "init")
+        self.write("wiki/raw/general/obsidian/link-cache.md", "---\nwiki: raw\ntype: source\ntitle: Link cache\n"
+                   "source: https://example.com/a\n---\nThe cache.\n")
+        self.sb("wiki", "new", "general/obsidian/frontmatter-links", "--title", "Obsidian property links",
+                "--type", "concept", "--summary", "S.", "--sources", "wiki/raw/general/obsidian/link-cache",
+                "--about", "How Obsidian stores notes.")
+        self.sb("wiki", "new", "general/obsidian/metadata-cache", "--title", "Metadata cache", "--type", "entity",
+                "--summary", "S.", "--sources", "wiki/raw/general/obsidian/link-cache",
+                "--related", "general/obsidian/frontmatter-links")
+        self.article = "wiki/general/obsidian/frontmatter-links.md"
+
+    def config(self, key, value):
+        subprocess.run(["git", "-C", str(self.vault), "config", key, value], check=True)
+
+    def test_every_write_uses_relative_links(self):
+        self.assertIn("sources:\n  - wiki/raw/general/obsidian/link-cache.md\n"
+                      "related:\n  - wiki/general/obsidian/frontmatter-links.md\n",
+                      self.read("wiki/general/obsidian/metadata-cache.md"))
+        self.sb("wiki", "set", "general/obsidian/frontmatter-links", "related+=general/obsidian/metadata-cache")
+        self.assertIn("related:\n  - wiki/general/obsidian/metadata-cache.md\n", self.read(self.article))
+        self.sb("wiki", "log", "learn", "--subject", "general/obsidian/metadata-cache",
+                "--raw", "wiki/raw/general/obsidian/link-cache")
+        log = self.read("wiki/log.md")
+        self.assertIn("learn | [Metadata cache](general/obsidian/metadata-cache.md)\n", log)
+        self.assertIn("- Raw: [Link cache](raw/general/obsidian/link-cache.md)\n", log)
+        self.assertIn("| [Metadata cache](general/obsidian/metadata-cache.md) | entity |", self.read("wiki/index.md"))
+        self.assertEqual(self.sb("wiki", "link", "general/obsidian/metadata-cache").stdout.strip(),
+                         "wiki/general/obsidian/metadata-cache.md")
+        self.assertIn("0 problem(s)", self.sb("wiki", "check").stdout)
+
+    def test_check_reads_relative_links_and_fix_writes_the_heading(self):
+        text = self.read(self.article).replace("sources:\n", "sources:\n  - wiki/raw/general/obsidian/nowhere.md\n")
+        self.write(self.article, text + "\nSee [the cache](metadata-cache.md), [gone](gone.md), "
+                   "[site](https://x.org/a.md) and `[x](nowhere.md)`.\n")
+        out = self.sb("wiki", "check", ok=False).stdout
+        for e in ("alias is not the target's heading: [the cache](metadata-cache.md) (heading: Metadata cache)",
+                  "broken link: [gone](gone.md)", "broken link: wiki/raw/general/obsidian/nowhere.md"):
+            self.assertIn(e, out)
+        self.assertNotIn("markdown link to a vault note", out)
+        self.assertNotIn("x.org", out)
+        self.assertNotIn("[x](nowhere.md)", out)
+        self.sb("wiki", "check", "--fix", ok=False)
+        self.assertIn("See [Metadata cache](metadata-cache.md),", self.read(self.article))
+
+    def test_sb_links_overrides_the_default(self):
+        self.config("sb.links", "wikilink")
+        self.sb("wiki", "new", "general/obsidian/third", "--title", "Third", "--type", "concept",
+                "--summary", "S.", "--sources", "wiki/raw/general/obsidian/link-cache")
+        self.assertIn('  - "[[wiki/raw/general/obsidian/link-cache|Link cache]]"\n',
+                      self.read("wiki/general/obsidian/third.md"))
 
 
 class Projects(Seeded):
@@ -672,7 +747,7 @@ tags:
 
 ## Overview
 
-Ids. See [[wiki/part-hierarchy/part-hierarchy|the topic]].
+Ids. See [[wiki/part-hierarchy/part-hierarchy|Part hierarchy]].
 """)
         self.write("wiki/raw/part-hierarchy/dump.md", "---\nwiki: raw\ntype: source\ntitle: Dump\nsource: x\n---\nIds.\n")
         self.sb("wiki", "log", "learn", "--subject", "wiki/part-hierarchy/part-ids")
@@ -691,7 +766,7 @@ Ids. See [[wiki/part-hierarchy/part-hierarchy|the topic]].
         art = self.read("wiki/monorepo/part-hierarchy/part-ids.md")
         self.assertIn("project: monorepo", art)
         self.assertIn("[[wiki/raw/monorepo/part-hierarchy/dump|Dump]]", art)
-        self.assertIn("[[wiki/monorepo/part-hierarchy/part-hierarchy|the topic]]", art)
+        self.assertIn("[[wiki/monorepo/part-hierarchy/part-hierarchy|Part hierarchy]]", art)
         self.assertIn("project: monorepo", self.read("wiki/monorepo/part-hierarchy/part-hierarchy.md"))
         self.assertNotIn("project", self.read("wiki/raw/monorepo/part-hierarchy/dump.md"))  # raw is never edited
         self.assertIn("[[wiki/monorepo/part-hierarchy/part-ids|", self.read("wiki/log.md"))

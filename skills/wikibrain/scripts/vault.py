@@ -5,10 +5,14 @@ A vault is any folder holding `wiki/` (an Obsidian vault, an llm-wiki clone). It
 `wayfinder/` tracker whose tickets articles cite as sources; the minimal ticket reading here is all
 the wiki needs of it.
 """
+import functools
 import os
+import posixpath
 import re
+import subprocess
 import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
 _default = Path.home() / "Documents" / "Second Brain"
 VAULT = Path(os.environ.get("SB_VAULT") or (_default if _default.is_dir() else Path.cwd()))
@@ -95,8 +99,36 @@ def rel(path):
         return str(p)
 
 
-def wikilink(path, alias):
+def title(props, body, stem):
+    """A note's title: its `# ` heading, else its `title` property, else its file name."""
+    m = re.search(r"^# (.+)$", body, re.M)
+    return m.group(1).strip() if m else str(props.get("title") or stem)
+
+
+@functools.cache
+def links():
+    """How this store writes links, its git config `sb.links`: `wikilink`, or `relative` (markdown
+    links GitHub renders); by default `relative` in a sync clone (one with `sb.projects`)."""
+    if not (VAULT / ".git").exists():
+        return "wikilink"
+    def get(key):
+        return subprocess.run(["git", "-C", str(VAULT), "config", "--get", key],
+                              capture_output=True, text=True).stdout.strip()
+    return get("sb.links") or ("relative" if get("sb.projects") else "wikilink")
+
+
+def md_link(path, text, here, anchor=""):
+    """A markdown link from the file `here` to `path`, both vault-relative."""
+    href = quote(posixpath.relpath(path, posixpath.dirname(here))) + (f"#{quote(anchor)}" if anchor else "")
+    return f"[{text}]({href})"
+
+
+def wikilink(path, alias, here=None):
+    """The store's link to a note: a full-path wikilink; in a relative store a markdown link from the
+    file `here`, or without `here` the repo-root path a property holds."""
     target = rel(path)
+    if links() == "relative":
+        return md_link(target, alias, rel(here)) if here else target
     target = target[:-3] if target.endswith(".md") else target
     return f"[[{target}|{alias}]]"
 
@@ -126,8 +158,8 @@ class Ticket:
     def id(self):
         return f"{self.num:03d}"
 
-    def link(self, alias=None):
-        return wikilink(self.path, alias or self.id)
+    def link(self, alias=None, here=None):
+        return wikilink(self.path, alias or self.id, here)
 
 
 class _Map:

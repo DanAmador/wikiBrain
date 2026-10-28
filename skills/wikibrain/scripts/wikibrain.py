@@ -29,14 +29,15 @@
                                             topics from before projects (wiki/<topic>/) move under
                                             <project>, links in wiki/ and wayfinder/ follow; a dry run
                                             unless --write
-  sync (a shared git clone of chosen projects, byte for byte)
+  sync (a shared git clone of chosen projects; its links relative, the vault's wikilinks)
     wikibrain.py dump <clone> [--projects a,b] [--exclude p/topic] [--base main]
                                             the vault's changes onto a new wiki-dump/<date> branch
     wikibrain.py import <clone>            merged changes from the base branch into the vault
 
 <project> is a repo's folder name under wayfinder/ (`monorepo`), or `general` for knowledge that
 holds outside any one repo. <note> is a vault path, `<project>/<topic>/<slug>` or a wikilink. <refs> are comma-separated vault paths,
-wikilinks, or `<map>#<NNN>` for a ticket; each is written as a full-path wikilink.
+wikilinks, or `<map>#<NNN>` for a ticket; each is written in the store's form (`sb.links`): a full-path
+wikilink, or in a relative store (a sync clone) the repo-root path.
 """
 import copy
 import functools
@@ -76,6 +77,7 @@ DISPUTED = re.compile(r"^> \[!question\] Disputed", re.M)
 OUTDATED = re.compile(r"^> \[!warning\] Outdated\b(.*)$", re.M)
 LINK = re.compile(r"(!?)\[\[([^\]|#]*)(#[^\]|]*)?(?:\|([^\]]*))?\]\]")
 MD_LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)")
+MD_FULL = re.compile(r"(!?)\[([^\]]*)\]\(([^)\s]+)\)")
 SCHEME = re.compile(r"[a-z][a-z0-9+.-]*:", re.I)
 CACHE = Path(os.environ.get("WIKIBRAIN_CACHE") or Path.home() / ".cache" / "wikibrain")
 
@@ -159,8 +161,7 @@ class Note:
 
     @property
     def title(self):
-        m = re.search(r"^# (.+)$", self.body, re.M)
-        return m.group(1).strip() if m else str(self.props.get("title") or self.path.stem)
+        return sb.title(self.props, self.body, self.path.stem)
 
     @property
     def rel(self):
@@ -170,8 +171,9 @@ class Note:
         v = self.props.get(key) or []
         return v if isinstance(v, list) else [v]
 
-    def link(self):
-        return sb.wikilink(self.path, self.title)
+    def link(self, here=None):
+        """The store's link to this note, for a property; `here`: the file a body link is written into."""
+        return sb.wikilink(self.path, self.title, here)
 
     def save(self, props=None, body=None):
         if props is not None:
@@ -215,13 +217,13 @@ def note_path(arg):
     return p
 
 
-def resolve_ref(ref):
-    """One <ref> -> (path, its full-path wikilink). Exits on a ref that names no note."""
+def resolve_ref(ref, here=None):
+    """One <ref> -> (path, the store's link to it; a body link from `here`). Exits on a ref that names no note."""
     ref = ref.strip()
     m = re.fullmatch(r"(.+)#(\d+)", ref)
     if m and not ref.startswith("[["):
         t = sb.load(m.group(1)).ticket(m.group(2))
-        return t.path, t.link("#" + t.id)
+        return t.path, t.link("#" + t.id, here)
     if ref.startswith("[["):
         p = link_path(ref)
     else:
@@ -231,8 +233,8 @@ def resolve_ref(ref):
         die(f"'{ref}' names no note")
     if "/wayfinder/" in "/" + sb.rel(p) and re.match(r"\d+[- ]", p.name) and p.parent.name == "issues":
         t = ticket(p)
-        return p, t.link("#" + t.id)
-    return p, Note(p).link()
+        return p, t.link("#" + t.id, here)
+    return p, Note(p).link(here)
 
 
 def split_refs(s):
@@ -404,7 +406,7 @@ def table(rows):
     lines = ["| Article | Type | Summary | Updated |", "|---|---|---|---|"]
     for n in rows:
         when = n.props.get("archived") if n.kind == "synthesis" else n.props.get("updated")
-        lines.append(f"| {esc(n.link())} | {n.props.get('type', '')} | "
+        lines.append(f"| {esc(n.link(wiki_dir() / 'index.md'))} | {n.props.get('type', '')} | "
                      f"{esc(n.props.get('summary', ''))} | {when or ''} |")
     return lines + [""]
 
@@ -1013,20 +1015,20 @@ def cmd_log(args):
     if kind not in ("learn", "ask", "tend"):
         die("usage: wiki log <learn|ask|tend> --subject \"…\"")
     subject = sb.opt(args, "--subject") or die("--subject is required")
+    p = wiki_dir() / "log.md"
+    if not p.exists():
+        die("no wiki/log.md: `wikibrain init`")
     m = re.fullmatch(r"(Archived: )?(.+)", subject)
     if not subject.startswith("no material: "):
         n = try_note(m.group(2))
         if n is not None:
-            subject = (m.group(1) or "") + n.link()
+            subject = (m.group(1) or "") + n.link(p)
     lines = [f"## [{today()}] {kind} | {subject}"]
     if sb.opt(args, "--disposition"):
         lines.append(f"- Disposition: {sb.opt(args, '--disposition')}")
     for flag, name in (("--raw", "Raw"), ("--updated", "Updated")):
         if sb.opt(args, flag):
-            lines.append(f"- {name}: " + ", ".join(link for _, link in map(resolve_ref, split_refs(sb.opt(args, flag)))))
-    p = wiki_dir() / "log.md"
-    if not p.exists():
-        die("no wiki/log.md: `wikibrain init`")
+            lines.append(f"- {name}: " + ", ".join(resolve_ref(r, p)[1] for r in split_refs(sb.opt(args, flag))))
     sb.write_atomic(p, p.read_text(encoding="utf-8").rstrip("\n") + "\n\n" + "\n".join(lines) + "\n")
     print(lines[0])
 
@@ -1229,8 +1231,17 @@ def outside_code(text, fn, keep_code=False):
     return "".join(out + [fn(text[last:])])
 
 
+def heading_alias(q, embed, anchor):
+    """The alias a link to `q` must carry, its `# ` heading, so a property can drop it and get it back;
+    None where any will do: an embed, a link to a section, a ticket (`#NNN`), a file that is no note."""
+    if embed or anchor or q.suffix != ".md" or raw_class(q) == "ticket":
+        return None
+    return Note(q).title
+
+
 def cmd_check(args):
     fix = "--fix" in args
+    relative = sb.links() == "relative"
     w = wiki_dir()
     if not w.is_dir():
         die("no wiki/ yet: `wikibrain init`")
@@ -1313,6 +1324,17 @@ def cmd_check(args):
         # links: in properties and prose
         changed = False
 
+        def aliased(link, alias, want, rebuilt):
+            nonlocal changed
+            if want is None or alias == want:
+                return link
+            if fix:
+                changed = True
+                fixed.append(f"{lab(p)}: alias set to the heading: {rebuilt}")
+                return rebuilt
+            problems.append(f"{lab(p)}: alias is not the target's heading: {link} (heading: {want})")
+            return link
+
         def repair(m, key=None):
             nonlocal changed
             target = m.group(2).strip()
@@ -1320,8 +1342,10 @@ def cmd_check(args):
                 if target:
                     problems.append(f"{lab(p)}: wikilink by bare file name: {m.group(0)}")
                 return m.group(0)
-            if target_of(target):
-                return m.group(0)
+            q = target_of(target)
+            if q:
+                want = heading_alias(q, m.group(1), m.group(3))
+                return aliased(m.group(0), m.group(4), want, f"[[{target}|{want}]]")
             name = Path(target).name
             hits = by_name(name if "." in name else name + ".md")
             if len(hits) == 1:
@@ -1343,6 +1367,23 @@ def cmd_check(args):
             problems.append(f"{lab(p)}: broken link: {m.group(0)}")
             return m.group(0)
 
+        def repair_md(m):
+            """A relative link, as a sync clone writes them: it resolves and carries the heading."""
+            href = m.group(3)
+            path, _, anchor = href.partition("#")
+            if SCHEME.match(href) or not path or path.startswith("/"):
+                return m.group(0)
+            q = target_of(os.path.normpath(os.path.join(os.path.dirname(sb.rel(p)), unquote(path))))
+            if q is None:
+                problems.append(f"{lab(p)}: broken link: {m.group(0)}")
+                return m.group(0)
+            want = heading_alias(q, m.group(1), anchor)
+            return aliased(m.group(0), m.group(2), want, f"[{want}]({href})")
+
+        def links_in(seg):
+            seg = LINK.sub(lambda m: repair(m), seg)
+            return MD_FULL.sub(repair_md, seg) if relative else seg
+
         props = dict(n.props)
         here = p.relative_to(w).parts[0]
         if props.get("project") != here:
@@ -1357,6 +1398,8 @@ def cmd_check(args):
                 kept = []
                 for e in v:
                     m = LINK.fullmatch(str(e).strip())
+                    if not m and key in REF_KEYS and not target_of(entry_key(e)):
+                        problems.append(f"{lab(p)}: broken link: {e}")
                     r = repair(m, key) if m else e
                     if r is not None:
                         kept.append(r)
@@ -1371,8 +1414,8 @@ def cmd_check(args):
             else:
                 problems.append(f"{lab(p)}: tags are {', '.join(old) or 'missing'}; the rule makes them {', '.join(tags)}")
         prose = outside_code(n.body, lambda seg: seg)
-        body = outside_code(n.body, lambda seg: LINK.sub(lambda m: repair(m), seg), keep_code=True)
-        for m in re.finditer(r"\[[^\]]*\]\((?!https?://|mailto:)([^)\s]+?\.md)\)", prose):
+        body = outside_code(n.body, links_in, keep_code=True)
+        for m in [] if relative else re.finditer(r"\[[^\]]*\]\((?!https?://|mailto:)([^)\s]+?\.md)\)", prose):
             problems.append(f"{lab(p)}: markdown link to a vault note: {m.group(0)} (a full-path wikilink belongs here)")
         bare = re.sub(r"\[\[[^\]]*\]\]|\[[^\]]*\]\([^)]*\)|https?://\S+", " ", prose)
         for m in re.finditer(r"(?:^|[^\w/&#\[])#(\d{2,4})\b", bare):

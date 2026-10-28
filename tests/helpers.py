@@ -21,13 +21,14 @@ class VaultCase(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def sb(self, *args, stdin=None, ok=True):
-        """Run sbmap; ok=True asserts exit 0, ok=False asserts non-zero, ok=None asserts nothing."""
+    def sb(self, *args, stdin=None, ok=True, vault=None):
+        """Run sbmap on the vault (or on `vault`, another store); ok=True asserts exit 0, ok=False
+        asserts non-zero, ok=None asserts nothing."""
         # PATH without /usr/local/bin keeps the real Obsidian CLI out of the tests
-        env = {**os.environ, "SB_VAULT": str(self.vault),
+        env = {**os.environ, "SB_VAULT": str(vault or self.vault),
                "WIKIBRAIN_CACHE": str(self.cache), "PATH": "/usr/bin:/bin"}
         r = subprocess.run([sys.executable, str(SBMAP), *args], capture_output=True, text=True,
-                           env=env, input=stdin, cwd=self.vault)
+                           env=env, input=stdin, cwd=vault or self.vault)
         if ok is True:
             self.assertEqual(r.returncode, 0, f"sbmap {' '.join(args)}\n{r.stdout}{r.stderr}")
         elif ok is False:

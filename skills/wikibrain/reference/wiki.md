@@ -120,6 +120,17 @@ article, update it, and set `verified` to the commit you read.
 Obsidian then resolve it to exactly one note. A bare `#NNN` resolves to the first ticket of that
 number in *any* map: always `sbmap link`. External sources are ordinary `https://` links.
 
+**Two link forms, one graph.** The vault writes `[[wiki/<project>/<topic>/<slug>|Title]]` in the
+body and `"[[wiki/raw/<project>/<topic>/<slug>|Title]]"` in list properties. A shared clone writes
+what GitHub renders: body links relative to the note's own file, `[Title](../topic/slug.md)`, and
+list properties (`sources`, `related`, `supersedes`, `superseded_by`, `disputes`) as plain repo-root
+paths, `wiki/raw/<project>/<topic>/<slug>.md`. A store's form is its git config `sb.links`
+(`wikilink` or `relative`); without it, a clone with `sb.projects` set is `relative` and anything
+else `wikilink`, and every wikibrain write (`new`, `set`, `log`, the index block) uses it. Readers
+take either form. The alias always being the heading is what lets a property drop it in the clone
+and get it back on import; `wiki check` holds it there. Embeds, links to a section (`#heading`) and
+ticket links (`#NNN`) are exempt.
+
 **Tags are edges.** Semantra makes every tag a `tag:<name>` node and links each note to it with a
 `tagged` edge, so articles meet through shared tags; a nested `a/b` will also hang under `tag:a`.
 So tag what an article is about with a concept tag (`obsidian/metadata-cache`, `three/instancing`),
@@ -259,7 +270,8 @@ read with `sbmap show`, as everywhere.
   `<project>/<topic>/<slug>`, or a wikilink.
 - `--project <repo>` narrows a read to that project plus `general`: what one repo's work can use.
 - `<refs>` are comma-separated vault paths, wikilinks, or `<map>#<NNN>` for a ticket; wikibrain writes
-  each as a full-path wikilink and refuses one that names no note.
+  each in the store's form (a full-path wikilink, or a repo-root path in a relative store) and refuses
+  one that names no note.
 - Every command reads notes through a graph cache, one JSON file per wiki root in `~/.cache/wikibrain`
   (`WIKIBRAIN_CACHE` moves it): each note's properties, body and edges (`sources`, `related`,
   `supersedes`, `disputes`, `tickets`, `paths`, and body links, wikilink or relative alike), re-read
@@ -271,7 +283,7 @@ read with `sbmap show`, as everywhere.
 | `wiki index [--project P] [--write]` | prints every project, topic and article, one line each. The first read of every verb, with `--project` set to the repo's. `--write` restamps the block into `index.md`, adding the markers if missing |
 | `wiki find <terms…> [--raw] [--project P] [--limit N]` | case-insensitive; a note matches any term; scored 3 per hit on title or aliases, 2 on summary, 1 in the body. Prints the top N (default 10): path, type, status, summary, score. `--raw` searches raw notes too (every class above), so `ask` works with Obsidian closed |
 | `wiki show <note> [--full]` | digest: properties, Overview, headings, every Outdated/Disputed callout. `--full` prints the body |
-| `wiki link <note>` | the wikilink to paste into prose |
+| `wiki link <note>` | the wikilink to paste into prose; in a relative store the repo-root path (a body link there is relative to the note it sits in) |
 | `wiki backlog [--project P] [--limit N]` | raw notes on the backlog that no article's `sources` cites and the log has not marked no-material; oldest `created` first (file time when there is none); default 10, and the total |
 | `wiki verify [--repo-root <clone>] [--project P] [--base origin/main] [--json]` | each article of the repo's project (default: the repo's name) checked against its git, worst first: **current**, **drifted** (a path changed since), **broken** (a path deleted or a symbol gone), **orphaned** (read on a branch gone from origin and the clone, never merged), **unanchored** (no source commit: anchored at `updated` with paths and identifiers guessed from backticked code, marked as guessed). Anchor: `verified`, else the newest source commit; target: the base when the anchor is on it, else `origin/<ref>`, else the local `<ref>`. Read-only git, cached |
 | **write** | |
@@ -283,14 +295,16 @@ read with `sbmap show`, as everywhere.
 | `wiki check [--fix]` | the lint below. Exits non-zero on any format or link problem; grounding suspects and the backlog are printed, never counted |
 | `wiki migrate <project> [topic…] [--write]` | moves topics from before projects (`wiki/<topic>/`, `wiki/raw/<topic>/`) under `<project>`, all of them or the named ones; sets `project` on what moved (sources excepted: they are never edited) and repoints every link in `wiki/` and `wayfinder/`. Lists the owner's notes elsewhere that link in, without touching them. A dry run unless `--write` |
 | **sync** | |
-| `wiki dump <clone> [--projects a,b] [--exclude p/topic,…] [--base main]` | copies the listed projects' notes (`wiki/<p>/`, `wiki/raw/<p>/`, minus excluded topics) byte for byte into a git clone, on a new branch `wiki-dump/<date>` cut from the base, refreshes the clone's own `wiki/index.md` and `wiki/log.md`, commits there; never touches the base, never pushes. Refuses on a dirty clone, when the base moved since the last import, or when a note matches the leak gate (machine paths, `obsidian://`, ticket links, any `sb.leak` pattern) |
-| `wiki import <clone>` | fast-forwards the clone's base, copies what changed on it since the last import into the vault (adds, edits, deletions), lists a note changed on both sides instead of overwriting it (exit 1), then reindexes the vault. The last import is the ref `refs/sb/last-sync` in the clone |
+| `wiki dump <clone> [--projects a,b] [--exclude p/topic,…] [--base main]` | copies the listed projects' notes (`wiki/<p>/`, `wiki/raw/<p>/`, minus excluded topics) into a git clone with their links converted to the clone's form and the vault-only properties dropped, on a new branch `wiki-dump/<date>` cut from the base, refreshes the clone's own `wiki/index.md` and `wiki/log.md`, commits there; never touches the base, never pushes. Refuses on a dirty clone, when the base moved since the last import, or when a note matches the leak gate (machine paths, `obsidian://`, ticket links, any `sb.leak` pattern) |
+| `wiki import <clone>` | fast-forwards the clone's base, copies what changed on it since the last import into the vault (adds, edits, deletions) with links converted back to wikilinks and the vault copy's vault-only properties kept, lists a note changed on both sides instead of overwriting it (exit 1), then reindexes the vault. Both sides are compared in the clone's form without vault-only properties, so a clone note still in wikilink form compares alike. The last import is the ref `refs/sb/last-sync` in the clone |
 
 ### What `wiki check` enforces
 
 - **Fixed with `--fix`:** the index block out of date; a wikilink whose target moved, when one note
   has that file name; a `related` link to a note that no longer exists (dropped); a `project`
-  property that disagrees with the note's folder.
+  property that disagrees with the note's folder; a link whose alias (wikilink) or text (relative
+  link) is not its target's `# ` heading, in properties and prose, on articles, synthesis pages and
+  folder notes alike.
 - **Format:** an unknown `wiki`, `type` or `status`; a property missing for its kind (an article
   without `summary`, `updated`, `status` or `sources`; a synthesis without `archived` or `sources`);
   `status` disagreeing with the rule under *Outdated and disputed claims*; an Outdated callout
@@ -302,8 +316,8 @@ read with `sbmap show`, as everywhere.
   (`owner/name`) and a full 40-character `commit`; `paths` and `symbols` are lists (`--fix` turns
   comma-separated text into a list); provenance on a note that is not raw, or a `verified` that is
   not a full commit on an article, is an error.
-- **Links:** a markdown link to a vault note, or a wikilink by bare file name, where a full-path
-  wikilink belongs; a bare `#NNN`; a `sources` entry of the wrong class for its note; a source ticket
+- **Links:** a markdown link to a vault note (in a wikilink store), or a wikilink by bare file name,
+  where a full-path wikilink belongs; a relative link or a repo-root path that names no file; a bare `#NNN`; a `sources` entry of the wrong class for its note; a source ticket
   that is not resolved; broken links, read from the files, so Obsidian need not be running. Links
   inside inline code and code blocks are text, never checked.
 - **Grounding suspects:** each article's candidate literals (quotes of 15+ characters, ISO dates,
@@ -317,10 +331,16 @@ read with `sbmap show`, as everywhere.
 
 Some projects are shared with a team (the monorepo's knowledge with `assemblio-development/llm-wiki`).
 The vault stays whole and primary; a clone of the shared repo sits outside it, and `wiki dump` /
-`wiki import` move only the listed projects between them, byte for byte, so the format, the
-full-path wikilinks and the properties are identical on both sides and a round trip loses nothing.
-The clone remembers its projects, excluded topics, base branch and extra leak patterns in its git
-config (`sb.projects`, `sb.exclude`, `sb.base`, `sb.leak`). Every change reaches the base by pull
+`wiki import` move only the listed projects between them. The format and the properties are the
+same on both sides; only the links change form (*Two link forms, one graph*): dump writes them
+relative and import writes them back as wikilinks, and since every alias is its target's heading,
+import(dump(note)) is the note again. A note with no link to convert crosses byte for byte, and a
+raw note's body is its source's own text, so it crosses as written (its properties still convert).
+Links inside inline code and code blocks are text and never converted. Vault-only properties, the
+clone's git config `sb.vaultOnly` (comma-separated, default `tickets`), are dropped on dump; import
+keeps the vault copy's values and never compares them. The clone remembers its projects, excluded
+topics, base branch, vault-only properties and extra leak patterns in its git config
+(`sb.projects`, `sb.exclude`, `sb.base`, `sb.vaultOnly`, `sb.leak`). Every change reaches the base by pull
 request: dump makes the owner's branch, teammates make theirs, and import brings merged work back.
 Repo-only files (the clone's README, AGENTS.md, CI, `wiki/index.md`, `wiki/log.md`) never enter
 the vault, and the vault's index, log, `wiki.base` and `wayfinder/` never leave it. Sources that

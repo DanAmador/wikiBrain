@@ -77,9 +77,10 @@ class DumpTest(SyncCase):
         r = self.dump()
         self.assertIn("wiki-dump/", r.stdout)
         self.assertTrue(self.git("branch", "--show-current").startswith("wiki-dump/"))
-        meshproxy = "wiki/monorepo/rendering/meshproxy.md"
-        self.assertEqual((self.clone / meshproxy).read_bytes(), (self.vault / meshproxy).read_bytes())
-        self.assertTrue((self.clone / "wiki/raw/monorepo/rendering/src.md").exists())
+        meshproxy, src = "wiki/monorepo/rendering/meshproxy.md", "wiki/raw/monorepo/rendering/src.md"
+        self.assertEqual((self.clone / meshproxy).read_text(), self.read(meshproxy).replace(
+            '"[[wiki/raw/monorepo/rendering/src|Source]]"', "wiki/raw/monorepo/rendering/src.md"))
+        self.assertEqual((self.clone / src).read_bytes(), (self.vault / src).read_bytes())
         self.assertFalse((self.clone / "wiki/monorepo/private").exists())
         self.assertFalse((self.clone / "wiki/sk4te").exists())
         self.assertIn("MeshProxy", (self.clone / "wiki/index.md").read_text())
@@ -89,6 +90,7 @@ class DumpTest(SyncCase):
         self.assertIn("### Articles (1)", body)
         self.assertIn("| 🆕 | **MeshProxy**: Parts are bones. | rendering | new |", body)
         self.assertIn("### Sources (raw notes) (1)", body)
+        self.assertIn("links converted to relative links and the vault-only properties (tickets) dropped", body)
         self.assertIn("gh pr create", r.stdout)
 
     def test_projects_are_remembered_and_a_second_dump_has_nothing_new(self):
@@ -149,6 +151,109 @@ class ImportTest(SyncCase):
         self.git("commit", "-q", "-m", "drop")
         self.sb("wiki", "import", str(self.clone))
         self.assertFalse(self.exists("wiki/raw/monorepo/rendering/src.md"))
+
+
+TAGS = "tags:\n  - wiki/{k}\n  - project/monorepo\n  - topic/rendering\n---\n"
+LINKED = {
+    "wiki/monorepo/rendering/rendering.md": "---\nwiki: topic\ntype: topic\nproject: monorepo\n"
+    "summary: How the viewer draws parts.\n" + TAGS.format(k="topic") + "# Rendering\n\n"
+    "How the viewer draws parts: [[wiki/monorepo/rendering/meshproxy|MeshProxy]].\n",
+    "wiki/monorepo/rendering/meshproxy.md": """---
+wiki: article
+type: concept
+project: monorepo
+status: current
+summary: Parts are bones.
+updated: 2026-10-28
+sources:
+  - "[[wiki/raw/monorepo/rendering/src|Source]]"
+  - "[[wiki/raw/monorepo/rendering/notes|Field notes]]"
+related:
+  - "[[wiki/monorepo/rendering/raycast|Raycast picking]]"
+tickets:
+  - "[[wayfinder/monorepo/x/issues/001-a|#001]]"
+""" + TAGS.format(k="concept") + """# MeshProxy
+
+## Overview
+
+Parts are bones, read from [[wiki/raw/monorepo/rendering/src|Source]], picked by
+[[wiki/monorepo/rendering/raycast#How it works|Raycast picking]] in [[wiki/monorepo/rendering/rendering|Rendering]].
+Docs: [three](https://threejs.org/docs/x.md). Code is text: `[[wiki/monorepo/rendering/raycast|R]]`.
+
+```
+[[wiki/raw/monorepo/rendering/src|Source]]
+```
+""",
+    "wiki/monorepo/rendering/raycast.md": ARTICLE.format(t="Raycast picking", s="Rays pick parts.").replace(
+        "  - wiki/concept\n", "  - wiki/concept\n  - project/monorepo\n  - topic/rendering\n")
+    + "\n## How it works\n\nA ray from [[wiki/monorepo/rendering/meshproxy|MeshProxy]].\n",
+    "wiki/raw/monorepo/rendering/notes.md": "---\nwiki: raw\ntype: source\nproject: monorepo\ntitle: Field notes\n"
+    "source: pasted by the owner\nrelated:\n  - \"[[wiki/raw/monorepo/rendering/src|Source]]\"\n---\n"
+    "As [[wiki/raw/monorepo/rendering/src|Source]] says, parts are bones. Its guide: [/AGENTS.md](../../AGENTS.md).\n",
+}
+
+
+class RoundTrip(SyncCase):
+    """The vault writes wikilinks, the clone relative links; import(export(x)) gives back x."""
+
+    def setUp(self):
+        super().setUp()
+        for rel, text in LINKED.items():
+            self.write(rel, text)
+        self.want = {rel: self.read(rel) for rel in [*LINKED, "wiki/raw/monorepo/rendering/src.md"]}
+        self.dump()
+
+    def clone_text(self, rel):
+        return (self.clone / rel).read_text()
+
+    def test_dump_converts_links_and_drops_vault_only_properties(self):
+        art = self.clone_text("wiki/monorepo/rendering/meshproxy.md")
+        self.assertIn("sources:\n  - wiki/raw/monorepo/rendering/src.md\n  - wiki/raw/monorepo/rendering/notes.md\n"
+                      "related:\n  - wiki/monorepo/rendering/raycast.md\ntags:", art)
+        self.assertNotIn("wayfinder", art)
+        self.assertIn("read from [Source](../../raw/monorepo/rendering/src.md), picked by\n"
+                      "[Raycast picking](raycast.md#How%20it%20works) in [Rendering](rendering.md).", art)
+        self.assertIn("[three](https://threejs.org/docs/x.md)", art)
+        self.assertIn("`[[wiki/monorepo/rendering/raycast|R]]`", art)
+        self.assertIn("```\n[[wiki/raw/monorepo/rendering/src|Source]]\n```", art)
+        self.assertIn("[MeshProxy](meshproxy.md)", self.clone_text("wiki/monorepo/rendering/rendering.md"))
+        src, notes = "wiki/raw/monorepo/rendering/src.md", "wiki/raw/monorepo/rendering/notes.md"
+        self.assertEqual((self.clone / src).read_bytes(), (self.vault / src).read_bytes())
+        self.assertEqual(self.clone_text(notes), self.read(notes).replace(  # a source's text is never converted
+            '  - "[[wiki/raw/monorepo/rendering/src|Source]]"', "  - wiki/raw/monorepo/rendering/src.md"))
+        self.assertIn("| [MeshProxy](monorepo/rendering/meshproxy.md) |", self.clone_text("wiki/index.md"))
+        self.assertIn("0 problem(s)", self.sb("wiki", "check", vault=self.clone).stdout)
+
+    def test_import_of_the_export_gives_back_every_note(self):
+        self.merge_dump()
+        for rel in self.want:
+            if rel != "wiki/monorepo/rendering/meshproxy.md":
+                (self.vault / rel).unlink()
+        r = self.sb("wiki", "import", str(self.clone))
+        self.assertIn("4 imported, 0 deleted, 0 conflicts", r.stdout)
+        for rel, text in self.want.items():
+            self.assertEqual(self.read(rel), text, rel)
+
+    def test_a_teammate_edit_comes_back_with_the_vault_only_properties(self):
+        self.merge_dump()
+        self.sb("wiki", "import", str(self.clone))
+        rel = "wiki/monorepo/rendering/meshproxy.md"
+        self.teammate_edit(rel, self.clone_text(rel).replace("Parts are bones, read", "Parts are joints, read"))
+        self.assertIn("1 imported", self.sb("wiki", "import", str(self.clone)).stdout)
+        self.assertEqual(self.read(rel), self.want[rel].replace("Parts are bones, read", "Parts are joints, read"))
+
+    def test_conflicts_are_found_in_repo_form_and_never_over_vault_only_properties(self):
+        self.merge_dump()
+        self.sb("wiki", "import", str(self.clone))
+        rel = "wiki/monorepo/rendering/meshproxy.md"
+        self.write(rel, self.want[rel].replace("001-a|#001", "002-b|#002"))
+        self.teammate_edit(rel, self.clone_text(rel).replace("Parts are bones, read", "Parts are joints, read"))
+        self.assertIn("1 imported, 0 deleted, 0 conflicts", self.sb("wiki", "import", str(self.clone)).stdout)
+        self.assertIn("002-b|#002", self.read(rel))
+        self.write(rel, self.read(rel).replace("Parts are joints", "Parts are owner's"))
+        self.teammate_edit(rel, self.clone_text(rel).replace("Parts are joints", "Parts are teammate's"))
+        self.assertIn("1 conflicts", self.sb("wiki", "import", str(self.clone), ok=False).stdout)
+        self.assertIn("Parts are owner's", self.read(rel))
 
 
 if __name__ == "__main__":
