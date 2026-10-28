@@ -273,6 +273,11 @@ read with `sbmap show`, as everywhere.
 - `<refs>` are comma-separated vault paths, wikilinks, or `<map>#<NNN>` for a ticket; wikibrain writes
   each in the store's form (a full-path wikilink, or a repo-root path in a relative store) and refuses
   one that names no note.
+- **Reading order for an agent.** `index` (with `--project` set to the repo's) first; then `covers
+  <paths…>` when the work touches known files (or `--diff <base>` for what it has changed), or `find
+  <terms…>` when it starts from a question; then `show <note>` for the digest of the notes that
+  matter. `show --full` only when the digest is not enough. Run `covers --diff` again before the PR:
+  an article that rests on a file you changed is one to update.
 - Every command reads notes through a graph cache, one JSON file per wiki root in `~/.cache/wikibrain`
   (`WIKIBRAIN_CACHE` moves it): each note's properties, body and edges (`sources`, `related`,
   `supersedes`, `disputes`, `tickets`, `paths`, and body links, wikilink or relative alike), re-read
@@ -287,6 +292,7 @@ read with `sbmap show`, as everywhere.
 | `wiki link <note>` | the wikilink to paste into prose; in a relative store the repo-root path (a body link there is relative to the note it sits in) |
 | `wiki backlog [--project P] [--limit N]` | raw notes on the backlog that no article's `sources` cites and the log has not marked no-material; oldest `created` first (file time when there is none); default 10, and the total |
 | `wiki verify [--repo-root <clone>] [--project P] [--base origin/main] [--json]` | each article of the repo's project (default: the repo's name) checked against its git, worst first: **current**, **drifted** (a path changed since), **broken** (a path deleted or a symbol gone), **orphaned** (read on a branch gone from origin and the clone, never merged), **unanchored** (no source commit: anchored at `updated` with paths and identifiers guessed from backticked code, marked as guessed). Anchor: `verified`, else the newest source commit; target: the base when the anchor is on it, else `origin/<ref>`, else the local `<ref>`. Read-only git, cached |
+| `wiki covers <paths…> [--diff <base>] [--repo-root <clone>] [--project P] [--base origin/main] [--json]` | the articles that rest on the given files or folders, one line each: verdict, note, summary, worst verdict first, then a count. An article's scope is its own `paths`, else the `paths` of the raw notes its `sources` cite (a trailing `@<hash>` is dropped); a path matches when equal, inside an article's folder, or when it is a folder holding the article's path. `--diff <base>` adds `git diff --name-only <base>` (working tree against base) and the untracked files, so an agent runs it before editing and again before a PR. Verdicts are `verify`'s, computed for the matched articles only, in `--repo-root` or the current directory when it is a clone with an origin (`--base` as in verify); with no clone the verdict reads `-`. Project: `--project`, else the clone's repo name, else every project. No paths and no `--diff` is an error |
 | **write** | |
 | `wiki init` | creates whatever of the layout is missing; never overwrites |
 | `wiki raw <project>/<topic> --title "…" --source "…" [--author "…"] [--published YYYY-MM-DD\|Unknown] [--repo-root <clone> [--rev <branch\|sha>] [--paths a,b] [--symbols a,b]] --from <file\|->` | writes a raw note from a file or stdin; the slug comes from the title (`-2` when taken). A `source` URL (or `pr`) another raw note already has prints that note and exits non-zero. Never overwrites. `--repo-root` stamps provenance: `repo` from origin, `commit` and `ref` of HEAD or of `--rev` (read without checking it out; a sha records no ref), and `paths` (each checked to exist at that commit) and `symbols` |

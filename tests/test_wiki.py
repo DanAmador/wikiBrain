@@ -444,6 +444,45 @@ class Verify(Seeded):
         self.commit("libs/viewport/Render.ts", "export const loop = 1\n", "rename symbol")
         self.assertEqual(self.verdicts()["render-loop"], "broken")
 
+    def covers(self, *a, **kw):
+        out = self.sb("wiki", "covers", *a, "--json", "--repo-root", str(self.clone), **kw).stdout
+        return {Path(r["note"]).stem: r["verdict"] for r in json.loads(out)}
+
+    def covered_articles(self):
+        """render-loop rests on libs/viewport/Render.ts through its source; own-paths on libs/own/ through its own paths."""
+        self.add_article("render-loop", self.git(self.clone, "rev-parse", "HEAD"))
+        self.add_article("own-paths")
+        self.sb("wiki", "set", "wiki/monorepo/rendering/own-paths", "paths=libs/own/@0123456789ab")
+
+    def test_covers_matches_a_file_a_folder_either_way_and_prints_the_verdict(self):
+        self.covered_articles()
+        self.assertEqual(self.covers("libs/viewport/Render.ts"), {"render-loop": "current"})
+        self.assertEqual(self.covers("./libs/viewport/"), {"render-loop": "current"})  # a folder holds the source's file
+        self.assertEqual(self.covers("libs/view"), {})
+        self.assertEqual(self.covers("libs/own/deep/File.ts"), {"own-paths": "unanchored"})  # inside the article's folder
+        self.assertEqual(self.covers("libs"), {"render-loop": "current", "own-paths": "unanchored"})
+        self.commit("libs/viewport/Render.ts", "export const frameloop = 'always'\n", "change")
+        out = self.sb("wiki", "covers", "libs", "--repo-root", str(self.clone)).stdout.splitlines()
+        self.assertTrue(out[0].startswith("drifted    wiki/monorepo/rendering/render-loop.md  S."), out)
+        self.assertTrue(out[1].startswith("unanchored wiki/monorepo/rendering/own-paths.md"), out)
+        self.assertIn("2 articles", out[-1])
+
+    def test_covers_diff_reads_edits_and_new_files_and_needs_some_path(self):
+        self.covered_articles()
+        (self.clone / "libs/viewport/Render.ts").write_text("edited\n")  # verdicts read the base, not the working tree
+        self.assertEqual(self.covers("--diff", "origin/main"), {"render-loop": "current"})
+        (self.clone / "libs/own").mkdir()
+        (self.clone / "libs/own/New.ts").write_text("new\n")
+        self.assertEqual(self.covers("--diff", "origin/main"), {"render-loop": "current", "own-paths": "unanchored"})
+        self.assertEqual(self.covers("--diff", "origin/main", "libs/nothing"),
+                         {"render-loop": "current", "own-paths": "unanchored"})
+        self.sb("wiki", "covers", "--repo-root", str(self.clone), ok=False)
+
+    def test_covers_without_a_clone_has_no_verdict(self):
+        self.covered_articles()
+        self.assertEqual(self.sb("wiki", "covers", "libs/viewport").stdout.splitlines()[0][:11], "-          ")
+        self.sb("wiki", "covers", "--diff", "main", ok=False)
+
     def test_branch_only_claim_is_checked_against_its_branch_then_orphaned(self):
         self.git(self.clone, "switch", "-q", "-c", "feature")
         sha = self.commit("libs/viewport/Clip.ts", "export const clipPrelude = 1\n", "feature", branch="feature")

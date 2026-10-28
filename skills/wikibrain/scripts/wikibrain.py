@@ -28,6 +28,9 @@
     wikibrain.py verify [--repo-root <clone>] [--project P] [--base origin/main] [--json]
                                             each article's claims checked against the repo's git:
                                             current, drifted, broken, orphaned or unanchored
+    wikibrain.py covers <paths…> [--diff <base>] [--repo-root <clone>] [--project P] [--base origin/main] [--json]
+                                            the articles that rest on those files or folders (or, with
+                                            --diff, on what changed since <base>): verdict, note, summary
     wikibrain.py migrate <project> [topic…] [--write]
                                             topics from before projects (wiki/<topic>/) move under
                                             <project>, links in wiki/ and wayfinder/ follow; a dry run
@@ -885,15 +888,12 @@ IDENT = re.compile(r"(?:[A-Z][A-Za-z0-9]+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Z][A-Z0-9_]
 VERDICTS = ("broken", "orphaned", "drifted", "unanchored", "current")
 
 
-def cmd_verify(args):
-    """Are an article's claims about a repo still true? Anchor at `verified` or the newest source
-    commit; compare against the base branch when the anchor is on it, else against the source's
-    branch; a deleted path or a vanished symbol is broken, a changed path drifted. An article
-    with no recorded source commit is anchored at its `updated` date on the base, with paths and
-    identifiers guessed from its backticked code, and says so."""
-    root = Path(sb.opt(args, "--repo-root", ".")).expanduser()
-    base = sb.opt(args, "--base", "origin/main")
-
+def repo_checker(root, base):
+    """The repo a clone's origin names, and `check(article)`: that article's verify row. Anchor at
+    `verified` or the newest source commit; compare against the base branch when the anchor is on
+    it, else against the source's branch; a deleted path or a vanished symbol is broken, a changed
+    path drifted. An article with no recorded source commit is anchored at its `updated` date on
+    the base, with paths and identifiers guessed from its backticked code, and says so."""
     @functools.lru_cache(maxsize=None)
     def git(*a):
         r = subprocess.run(["git", "-C", str(root), *a], capture_output=True, text=True)
@@ -901,7 +901,6 @@ def cmd_verify(args):
 
     origin = git("remote", "get-url", "origin") or die(f"{root} is not a git clone with an origin")
     repo = repo_name(origin)
-    project = sb.opt(args, "--project") or repo.split("/")[-1]
     git("rev-parse", "--verify", base) is not None or die(f"no {base} in {root}: git fetch first")
     tree = set((git("ls-tree", "-r", "--name-only", base) or "").splitlines())
     dirs = {"/".join(t.split("/")[:i]) for t in tree for i in range(1, t.count("/") + 1)}
@@ -921,12 +920,8 @@ def cmd_verify(args):
         names = {t for t in toks if IDENT.fullmatch(t) and t not in paths and not any(p.endswith(t) for p in paths)}
         return sorted(paths), sorted(names)
 
-    rows = []
-    for n in articles():
-        if n.kind != "article" or project_of(n.path) != project:
-            continue
-        srcs = [Note(p) for p in (target_of(entry_key(e)) for e in n.refs("sources")) if p and Note(p).kind == "raw"]
-        mine = [x for x in srcs if x.props.get("repo") == repo and SHA.fullmatch(str(x.props.get("commit", "")))]
+    def check(n):
+        mine = [x for x in raw_sources(n) if x.props.get("repo") == repo and SHA.fullmatch(str(x.props.get("commit", "")))]
         row = {"note": n.rel, "anchor": None, "ref": None, "target": None, "guessed": False,
                "paths": [], "symbols": [], "changed": [], "gone": [], "commits_since": 0}
         if mine:
@@ -941,16 +936,14 @@ def cmd_verify(args):
         if SHA.fullmatch(str(n.props.get("verified", ""))):
             row["anchor"] = n.props["verified"]
         if not row["anchor"] or not (row["paths"] or row["symbols"]) or git("cat-file", "-e", row["anchor"] + "^{commit}") is None:
-            rows.append({**row, "verdict": "unanchored"})
-            continue
+            return {**row, "verdict": "unanchored"}
         if git("merge-base", "--is-ancestor", row["anchor"], base) is not None:
             row["target"] = base
         elif row["ref"] and (target := next((t for t in (f"origin/{row['ref']}", row["ref"])
                                              if git("rev-parse", "--verify", t) is not None), None)):
             row["target"] = target
         else:
-            rows.append({**row, "verdict": "orphaned"})
-            continue
+            return {**row, "verdict": "orphaned"}
         t, a = row["target"], row["anchor"]
         if row["paths"]:
             row["changed"] = (git("diff", "--name-status", a, t, "--", *row["paths"]) or "").splitlines()
@@ -960,7 +953,22 @@ def cmd_verify(args):
                         if git("grep", "-q", "-w", "-F", y.split(".")[0], t, "--", ".", ":!*.md") is None]
         verdict = ("broken" if row["gone"] or any(c[:1] in "DR" for c in row["changed"])
                    else "drifted" if row["changed"] else "current")
-        rows.append({**row, "verdict": verdict})
+        return {**row, "verdict": verdict}
+
+    return repo, check
+
+
+def raw_sources(n):
+    return [Note(p) for p in (target_of(entry_key(e)) for e in n.refs("sources")) if p and Note(p).kind == "raw"]
+
+
+def cmd_verify(args):
+    """Are an article's claims about a repo still true? See `repo_checker`."""
+    root = Path(sb.opt(args, "--repo-root", ".")).expanduser()
+    base = sb.opt(args, "--base", "origin/main")
+    repo, check = repo_checker(root, base)
+    project = sb.opt(args, "--project") or repo.split("/")[-1]
+    rows = [check(n) for n in articles() if n.kind == "article" and project_of(n.path) == project]
     rows.sort(key=lambda r: (VERDICTS.index(r["verdict"]), r["note"]))
     if "--json" in args:
         print(json.dumps(rows, indent=1))
@@ -974,6 +982,49 @@ def cmd_verify(args):
     counts = {v: sum(r["verdict"] == v for r in rows) for v in VERDICTS}
     print(f"{len(rows)} articles in {project} against {repo} {base}: "
           + ", ".join(f"{c} {v}" for v, c in counts.items() if c))
+
+
+def repo_path(p):
+    """A repo-relative POSIX path with no `./`, trailing slash or `@<blob>` suffix; '' is the repo."""
+    q = os.path.normpath(re.sub(r"@[0-9a-f]{7,40}$", "", p.strip())).strip("/")
+    return "" if q == "." else q
+
+
+def cmd_covers(args):
+    """The articles that rest on the given files or folders: an article's `paths`, else its sources'."""
+    flags = ("--diff", "--repo-root", "--project", "--base")
+    given = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] not in flags)]
+    root, diff, base = sb.opt(args, "--repo-root"), sb.opt(args, "--diff"), sb.opt(args, "--base", "origin/main")
+    if root is None and subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True).returncode == 0:
+        root = "."
+    if diff:
+        root or die("--diff needs a git clone: --repo-root <clone>, or run in one")
+        for a in (["diff", "--name-only", diff], ["ls-files", "--others", "--exclude-standard"]):
+            r = subprocess.run(["git", "-C", str(Path(root).expanduser()), *a], capture_output=True, text=True)
+            r.returncode and die(f"git {' '.join(a)} in {root}: {r.stderr.strip() or 'failed'}")
+            given += r.stdout.splitlines()
+    elif not given:
+        die("covers needs paths or --diff <base>")
+    given = sorted({repo_path(p) for p in given})
+    repo, check = repo_checker(Path(root).expanduser(), base) if root else (None, None)
+    project = sb.opt(args, "--project") or (repo and repo.split("/")[-1])
+    rows = []
+    for n in articles():
+        if n.kind != "article" or not in_scope(n.path, project):
+            continue
+        mine = {repo_path(p) for p in text_list(n, "paths") or [p for x in raw_sources(n) for p in text_list(x, "paths")]}
+        if any(not p or not a or p == a or a.startswith(p + "/") or p.startswith(a + "/") for p in given for a in mine):
+            rows.append({"note": n.rel, "verdict": check(n)["verdict"] if check else "-",
+                         "summary": " ".join(str(n.props.get("summary", "")).split())})
+    rows.sort(key=lambda r: ((*VERDICTS, "-").index(r["verdict"]), r["note"]))
+    if "--json" in args:
+        print(json.dumps(rows, indent=1))
+        return
+    for r in rows:
+        print(f"{r['verdict']:<10} {r['note']}  {r['summary']}")
+    counts = {v: sum(r["verdict"] == v for r in rows) for v in VERDICTS}
+    print(f"{len(rows)} articles rest on {len(given)} given paths"
+          + (f" in {project}: " + ", ".join(f"{c} {v}" for v, c in counts.items() if c) if check and rows else ""))
 
 
 # ---- set ------------------------------------------------------------------
@@ -1580,7 +1631,7 @@ def cmd_sync(name):
 
 COMMANDS = {"index": cmd_index, "find": cmd_find, "show": cmd_show, "link": cmd_link,
             "backlog": cmd_backlog, "init": cmd_init, "raw": cmd_raw, "new": cmd_new, "set": cmd_set,
-            "log": cmd_log, "check": cmd_check, "verify": cmd_verify,
+            "log": cmd_log, "check": cmd_check, "verify": cmd_verify, "covers": cmd_covers,
             "migrate": cmd_migrate, "dump": cmd_sync("dump"), "import": cmd_sync("import")}
 
 
