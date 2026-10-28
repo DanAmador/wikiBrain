@@ -25,8 +25,9 @@ class VaultCase(unittest.TestCase):
         """Run sbmap on the vault (or on `vault`, another store); ok=True asserts exit 0, ok=False
         asserts non-zero, ok=None asserts nothing."""
         # PATH without /usr/local/bin keeps the real Obsidian CLI out of the tests
+        gh = Path(self._tmp.name) / "bin"
         env = {**os.environ, "SB_VAULT": str(vault or self.vault),
-               "WIKIBRAIN_CACHE": str(self.cache), "PATH": "/usr/bin:/bin"}
+               "WIKIBRAIN_CACHE": str(self.cache), "PATH": f"{gh}:/usr/bin:/bin" if gh.is_dir() else "/usr/bin:/bin"}
         r = subprocess.run([sys.executable, str(SBMAP), *args], capture_output=True, text=True,
                            env=env, input=stdin, cwd=vault or self.vault)
         if ok is True:
@@ -34,6 +35,19 @@ class VaultCase(unittest.TestCase):
         elif ok is False:
             self.assertNotEqual(r.returncode, 0, f"sbmap {' '.join(args)} should fail\n{r.stdout}")
         return r
+
+    def fake_gh(self, pr, comments=(), reviews=(), inline=(), fail=None):
+        """A `gh` first on PATH that answers `pr view` with `pr` and `api` with the REST lists (one
+        page each), or exits 1 with `fail`: the tests never reach the network."""
+        gh = Path(self._tmp.name) / "bin" / "gh"
+        gh.parent.mkdir(exist_ok=True)
+        data = {"pr": pr, "issues/comments": list(comments), "pulls/reviews": list(reviews),
+                "pulls/comments": list(inline), "fail": fail}
+        gh.write_text(f"#!{sys.executable}\nimport json, sys\nd = {data!r}\na = sys.argv[1:]\n"
+                      "if d['fail']:\n    sys.exit(print(d['fail'], file=sys.stderr) or 1)\n"
+                      "if a[:2] == ['pr', 'view']:\n    print(json.dumps(d['pr']))\n"
+                      "else:\n    p = a[1].split('/')\n    print(json.dumps([d[p[-3] + '/' + p[-1]]]))\n")
+        gh.chmod(0o755)
 
     def write(self, rel, text):
         p = self.vault / rel

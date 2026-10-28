@@ -287,6 +287,88 @@ class Provenance(Seeded):
         self.sb("wiki", "raw", "monorepo/rendering", "--title", "T", "--source", "s", "--paths", "a",
                 "--from", str(src), ok=False)
 
+    PR = "https://github.com/org/monorepo/pull/7"
+
+    def pr(self, **over):
+        sha = "b" * 40
+        return {"title": "Render on demand", "body": "Switches the frameloop.\r\nSee @alice.\n",
+                "mergeCommit": {"oid": sha}, "headRefName": "feat/demand", "headRefOid": "c" * 40,
+                "baseRefName": "main", "createdAt": "2026-03-01T10:00:00Z", "mergedAt": "2026-03-04T09:30:00Z",
+                "files": [{"path": "libs/viewport/Render.ts", "changeType": "MODIFIED"},
+                          {"path": "libs/viewport/Old.ts", "changeType": "DELETED"},
+                          {"path": "apps/web/main.ts", "changeType": "MODIFIED"}], **over}
+
+    def test_raw_pr_merged_keeps_description_and_discussion_without_people_or_bots(self):
+        human, bot = {"login": "bob", "type": "User"}, {"login": "coderabbitai[bot]", "type": "Bot"}
+        self.fake_gh(self.pr(), comments=[{"user": human, "body": "Why demand?"}, {"user": bot, "body": "Walkthrough"}],
+                     reviews=[{"user": human, "body": ""}, {"user": human, "body": "Looks good."}],
+                     inline=[{"user": human, "path": "libs/viewport/Render.ts", "body": "Name it."},
+                             {"user": bot, "path": "a.ts", "body": "Nit."}])
+        rel = self.sb("wiki", "raw", "monorepo/rendering", "--pr", self.PR + "/files").stdout.strip()
+        text = self.read(rel)
+        for line in ("title: Render on demand", f'source: "{self.PR}"', f'pr: "{self.PR}"', "repo: org/monorepo",
+                     f"commit: {'b' * 40}", "ref: main", "published: 2026-03-04",
+                     "paths:\n  - libs/viewport/Render.ts\n  - apps/web/main.ts\n"):
+            self.assertIn(line, text)
+        self.assertTrue(text.endswith("---\nSwitches the frameloop.\nSee @alice.\n\nWhy demand?\n\nLooks good."
+                                      "\n\nlibs/viewport/Render.ts: Name it.\n"), text)
+        for gone in ("bob", "Walkthrough", "Nit.", "coderabbit"):
+            self.assertNotIn(gone, text)
+        self.assertNotRegex(text, r"author: \S")
+        self.assertIn("0 problem", self.sb("wiki", "check").stdout)
+
+    def test_raw_pr_open_records_the_head_and_narrows_paths_to_a_folder(self):
+        self.fake_gh(self.pr(mergeCommit=None, mergedAt=None))
+        rel = self.sb("wiki", "raw", "monorepo/rendering", "--pr", self.PR, "--paths", "libs/viewport/",
+                      "--title", "Mine").stdout.strip()
+        text = self.read(rel)
+        for line in (f"commit: {'c' * 40}", "ref: feat/demand", "published: 2026-03-01", "title: Mine",
+                     "paths:\n  - libs/viewport/Render.ts\n"):
+            self.assertIn(line, text)
+        self.assertNotIn("main.ts", text)
+        r = self.sb("wiki", "raw", "monorepo/rendering", "--pr", "https://github.com/org/monorepo/pull/8",
+                    "--paths", "nowhere/", ok=False)
+        self.assertIn("matches no file", r.stdout + r.stderr)
+
+    def test_raw_pr_with_repo_root_checks_the_commit_and_paths_in_the_clone(self):
+        root, sha = self.repo()
+        self.fake_gh(self.pr(mergeCommit={"oid": sha}, files=[{"path": "libs/viewport/Render.ts"}]))
+        rel = self.sb("wiki", "raw", "monorepo/rendering", "--pr", self.PR, "--repo-root", str(root)).stdout.strip()
+        self.assertIn(f"commit: {sha}\nref: main", self.read(rel))
+        other = "https://github.com/org/monorepo/pull/8"
+        self.fake_gh(self.pr(mergeCommit={"oid": "d" * 40}, files=[{"path": "libs/viewport/Render.ts"}]))
+        r = self.sb("wiki", "raw", "monorepo/rendering", "--pr", other, "--repo-root", str(root), "--title", "Again",
+                    ok=False)
+        self.assertIn("rev-parse", r.stdout + r.stderr)
+        self.fake_gh(self.pr(mergeCommit={"oid": sha}, files=[{"path": "libs/nowhere.ts"}]))
+        r = self.sb("wiki", "raw", "monorepo/rendering", "--pr", other, "--repo-root", str(root), "--title", "Again",
+                    ok=False)
+        self.assertIn("does not exist", r.stdout + r.stderr)
+
+    def test_raw_pr_refuses_a_duplicate_and_a_missing_or_failing_gh(self):
+        r = self.sb("wiki", "raw", "monorepo/rendering", "--pr", self.PR, ok=False)
+        self.assertIn("gh is not installed", r.stdout + r.stderr)
+        self.fake_gh(self.pr(), fail="gh: HTTP 404")
+        self.assertIn("HTTP 404", self.sb("wiki", "raw", "monorepo/rendering", "--pr", self.PR, ok=False).stderr)
+        self.sb("wiki", "raw", "monorepo/rendering", "--pr", "not a url", ok=False)
+        self.fake_gh(self.pr())
+        first = self.sb("wiki", "raw", "monorepo/rendering", "--pr", self.PR).stdout.strip()
+        n = len(list((self.vault / "wiki/raw").rglob("*.md")))
+        for extra in ([], ["--title", "Other", "--source", "elsewhere"]):
+            r = self.sb("wiki", "raw", "monorepo/other", "--pr", self.PR, *extra, ok=False)
+            self.assertIn(first, r.stdout)
+        src = self.write("scratch.txt", "x\n")
+        r = self.sb("wiki", "raw", "monorepo/other", "--title", "Same url", "--source", self.PR, "--from", str(src),
+                    ok=False)
+        self.assertIn(first, r.stdout)
+        self.assertEqual(len(list((self.vault / "wiki/raw").rglob("*.md"))), n)
+
+    def test_check_holds_the_pr_url_shape(self):
+        raw = "wiki/raw/general/obsidian/link-cache.md"
+        self.write(raw, self.read(raw).replace("created: 2026-01-02\n", "created: 2026-01-02\nrepo: org/monorepo\n"
+                                               f"commit: {'a' * 40}\npr: https://example.com/x\n"))
+        self.assertIn("pr is not an https://github.com", self.sb("wiki", "check", ok=False).stdout)
+
     def test_check_flags_bad_provenance_and_fix_makes_text_paths_lists(self):
         raw = "wiki/raw/general/obsidian/link-cache.md"
         self.write(raw, self.read(raw).replace("created: 2026-01-02\n", "created: 2026-01-02\nrepo: org/monorepo\n"

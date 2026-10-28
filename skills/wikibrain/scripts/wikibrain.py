@@ -17,6 +17,9 @@
                           [--repo-root <clone> [--rev <branch|sha>] [--paths a,b] [--symbols a,b]]
                           --from <file|->   keeps a source as a raw note; --repo-root stamps the repo,
                                             commit and ref it was read at (HEAD, or --rev)
+    wikibrain.py raw <project>/<topic> --pr <url> [--title "…"] [--source "…"] [--paths a,b] [--symbols a,b]
+                          [--repo-root <clone>]
+                                            a GitHub pull request, read through gh, as a raw note
     wikibrain.py new <project>/<topic>/<slug> --title "…" --type concept|entity|synthesis --summary "…"
                           --sources <refs> [--related <refs>] [--aliases "a, b"] [--tags "a, b"] [--about "…"]
     wikibrain.py set <note> key=value … [key+=<refs>] [key-=<refs>]
@@ -55,11 +58,12 @@ import vault as sb
 
 WIKI_KEYS = ["wiki", "type", "project", "status", "title", "source", "author", "published", "created", "summary",
              "updated", "reviewed", "verified", "archived", "sources", "related", "supersedes", "superseded_by",
-             "disputes", "aliases", "tags", "repo", "commit", "ref", "paths", "symbols"]
-PROVENANCE = ("repo", "commit", "ref", "paths", "symbols")
+             "disputes", "aliases", "tags", "repo", "commit", "ref", "pr", "paths", "symbols"]
+PROVENANCE = ("repo", "commit", "ref", "pr", "paths", "symbols")
 TEXT_LISTS = ("aliases", "tags", "paths", "symbols")
 SHA = re.compile(r"[0-9a-f]{40}")
 REPO = re.compile(r"[\w.-]+/[\w.-]+")
+PR_URL = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
 KINDS = {"article", "synthesis", "raw", "topic", "index", "log"}
 TYPES = {"article": {"concept", "entity"}, "synthesis": {"synthesis"}, "raw": {"source"},
          "topic": {"topic"}}
@@ -737,25 +741,40 @@ def cmd_raw(args):
     project, topic = parts
     check_name("project", project)
     check_name("topic", topic)
-    title = sb.opt(args, "--title") or die("--title is required")
-    source = sb.opt(args, "--source") or die("--source is required")
-    src = sb.opt(args, "--from") or die("--from <file|-> is required")
-    if re.match(r"https?://", source):
-        for p in raw_notes():
-            if raw_class(p) in ("raw", "clipping") and Note(p).props.get("source") == source:
-                print(sb.rel(p))
-                die(f"{source} is already kept as {sb.rel(p)}")
-    text = sys.stdin.read() if src == "-" else Path(src).expanduser().read_text(encoding="utf-8")
+    pr, pr_url = sb.opt(args, "--pr"), None
+    if pr:
+        m = PR_URL.match(pr) or die(f"--pr takes https://github.com/<owner>/<name>/pull/<n>, not {pr}")
+        if "--from" in args or "--rev" in args:
+            die("--pr replaces --from and sets the commit: drop --from and --rev")
+        pr_url = f"https://github.com/{m[1]}/pull/{m[2]}"
+    title = sb.opt(args, "--title") or (None if pr else die("--title is required"))
+    source = sb.opt(args, "--source") or (pr_url if pr else die("--source is required"))
+    src = None if pr else sb.opt(args, "--from") or die("--from <file|-> is required")
+    same = ([("source", source)] if re.match(r"https?://", source) else []) + ([("pr", pr_url)] if pr else [])
+    for p in raw_notes():
+        if raw_class(p) in ("raw", "clipping") and any(Note(p).props.get(k) == v for k, v in same):
+            print(sb.rel(p))
+            die(f"{same[-1][1]} is already kept as {sb.rel(p)}")
+    if pr:
+        found = read_pr(m[1], m[2], split_text(sb.opt(args, "--paths", "")))
+        title = title or found["title"]
+    text = found["text"] if pr else sys.stdin.read() if src == "-" else Path(src).expanduser().read_text(encoding="utf-8")
     base = slugify(title) or "source"
     slug, i = base, 1
     while slug_taken(slug):
         i += 1
         slug = f"{base}-{i}"
     props = {"wiki": "raw", "type": "source", "project": project, "title": title, "source": source,
-             "author": sb.opt(args, "--author", ""), "published": sb.opt(args, "--published", "Unknown"),
+             "author": sb.opt(args, "--author", ""),
+             "published": sb.opt(args, "--published", found["published"] if pr else "Unknown"),
              "created": today(), "tags": base_tags("wiki/source", project, topic)}
     root = sb.opt(args, "--repo-root")
-    if root:
+    if pr:
+        props.update(repo=m[1], commit=found["commit"], ref=found["ref"], pr=pr_url, paths=found["paths"],
+                     symbols=split_text(sb.opt(args, "--symbols", "")))
+        if root:  # the commit and each path must exist in the clone
+            provenance(Path(root).expanduser(), props["paths"], [], found["commit"])
+    elif root:
         props.update(provenance(Path(root).expanduser(), split_text(sb.opt(args, "--paths", "")),
                                 split_text(sb.opt(args, "--symbols", "")), sb.opt(args, "--rev", "HEAD")))
     elif sb.opt(args, "--paths") or sb.opt(args, "--symbols") or sb.opt(args, "--rev"):
@@ -764,6 +783,43 @@ def cmd_raw(args):
     path.parent.mkdir(parents=True, exist_ok=True)
     sb.write_atomic(path, sb.dump_fm(props, WIKI_KEYS) + text)
     print(sb.rel(path))
+
+
+def gh(*a):
+    """What `gh` prints, as JSON; a missing or failing gh stops the command."""
+    try:
+        r = subprocess.run(["gh", *a], capture_output=True, text=True)
+    except FileNotFoundError:
+        die("gh is not installed: wiki raw --pr reads the pull request through it")
+    if r.returncode:
+        die(f"gh {' '.join(a[:2])} failed: {r.stderr.strip() or 'no output'}")
+    return json.loads(r.stdout)
+
+
+def read_pr(repo, num, only):
+    """A pull request as a raw note: its description, then the human discussion in order (comments,
+    reviews with a body, inline review comments led by their file); no names, no bots. Merged: the
+    merge commit on the base branch; else the head commit on its branch. Paths: the changed files
+    the PR did not delete, narrowed to `only` (files or folders; one that matches nothing is an error)."""
+    pr = gh("pr", "view", f"https://github.com/{repo}/pull/{num}", "--json",
+            "title,body,mergeCommit,headRefName,headRefOid,baseRefName,files,createdAt,mergedAt")
+    parts = [pr.get("body") or ""]
+    for kind in ("issues/%s/comments", "pulls/%s/reviews", "pulls/%s/comments"):
+        for c in (x for page in gh("api", f"repos/{repo}/{kind % num}", "--paginate", "--slurp") for x in page):
+            u = c.get("user") or {}
+            if u.get("type") != "Bot" and not u.get("login", "").endswith("[bot]"):
+                parts.append(f"{c['path']}: {c['body']}" if c.get("path") else c.get("body") or "")
+    files = [f["path"] for f in pr["files"] if f.get("changeType") != "DELETED"]
+    if only:
+        for o in only:
+            if not any(f == o.rstrip("/") or f.startswith(o.rstrip("/") + "/") for f in files):
+                die(f"--paths '{o}' matches no file the pull request changed")
+        files = [f for f in files if any(f == o.rstrip("/") or f.startswith(o.rstrip("/") + "/") for o in only)]
+    merged = (pr.get("mergeCommit") or {}).get("oid")
+    return {"title": pr["title"], "paths": files, "commit": merged or pr["headRefOid"],
+            "ref": pr["baseRefName"] if merged else pr["headRefName"],
+            "published": ((merged and pr.get("mergedAt")) or pr["createdAt"])[:10],
+            "text": "\n\n".join(t.replace("\r\n", "\n").strip() for t in parts if t.strip()) + "\n"}
 
 
 def split_text(value):
@@ -811,6 +867,8 @@ def provenance_problems(n, kind):
             out.append("provenance without a repo (owner/name)")
         if not SHA.fullmatch(str(props.get("commit", ""))):
             out.append("provenance without a full 40-character commit")
+        if props.get("pr") and not PR_URL.fullmatch(str(props["pr"])):
+            out.append("pr is not an https://github.com/<owner>/<name>/pull/<n> URL")
         out += [f"{k} is text, not a list: `wikibrain check --fix`" for k in ("paths", "symbols")
                 if isinstance(props.get(k), str)]
     elif kind != "raw":

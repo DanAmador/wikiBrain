@@ -104,11 +104,12 @@ Properties, in this order; wikibrain omits an empty list:
 | `disputes` | articles that disagree with this one; always both ends |
 | `aliases` | other names the concept goes by: what `wiki find` and Obsidian match |
 | `tags` | `wiki/<type>`, `project/<project>`, `topic/<topic>`, then the concept tags (`wiki new --tags`, `wiki set tags+=`) |
-| `repo`, `commit`, `ref` | raw notes read from a repo: `owner/name`, the full commit and the branch it was read at (`wiki raw --repo-root <clone>` fills them) |
+| `repo`, `commit`, `ref` | raw notes read from a repo: `owner/name`, the full commit and the branch it was read at (`wiki raw --repo-root <clone>` or `--pr` fills them) |
+| `pr` | raw notes read from a pull request: its `https://github.com/<owner>/<name>/pull/<n>` URL (`wiki raw --pr`); needs `repo` and `commit` beside it |
 | `paths`, `symbols` | raw notes read from a repo: the files or folders, and the identifiers, its claims rest on (`--paths`, `--symbols`); checked to exist at that commit |
 
 **Provenance makes claims checkable.** A claim about code is only as good as the commit it was read
-at: a raw note from a repo records where (`repo`, `commit`, `ref`, `paths`), so a later check can
+at: a raw note from a repo records where (`repo`, `commit`, `ref`, `pr`, `paths`), so a later check can
 diff those paths and grep those symbols on main, or on the branch when the code is not merged yet.
 `wikibrain verify --repo-root <clone>` does exactly that for every article of the repo's project:
 **current**, **drifted** (a path changed since), **broken** (a path deleted or a symbol gone),
@@ -288,7 +289,8 @@ read with `sbmap show`, as everywhere.
 | `wiki verify [--repo-root <clone>] [--project P] [--base origin/main] [--json]` | each article of the repo's project (default: the repo's name) checked against its git, worst first: **current**, **drifted** (a path changed since), **broken** (a path deleted or a symbol gone), **orphaned** (read on a branch gone from origin and the clone, never merged), **unanchored** (no source commit: anchored at `updated` with paths and identifiers guessed from backticked code, marked as guessed). Anchor: `verified`, else the newest source commit; target: the base when the anchor is on it, else `origin/<ref>`, else the local `<ref>`. Read-only git, cached |
 | **write** | |
 | `wiki init` | creates whatever of the layout is missing; never overwrites |
-| `wiki raw <project>/<topic> --title "…" --source "…" [--author "…"] [--published YYYY-MM-DD\|Unknown] [--repo-root <clone> [--rev <branch\|sha>] [--paths a,b] [--symbols a,b]] --from <file\|->` | writes a raw note from a file or stdin; the slug comes from the title (`-2` when taken). A `source` URL another raw note already has prints that note and exits non-zero. Never overwrites. `--repo-root` stamps provenance: `repo` from origin, `commit` and `ref` of HEAD or of `--rev` (read without checking it out; a sha records no ref), and `paths` (each checked to exist at that commit) and `symbols` |
+| `wiki raw <project>/<topic> --title "…" --source "…" [--author "…"] [--published YYYY-MM-DD\|Unknown] [--repo-root <clone> [--rev <branch\|sha>] [--paths a,b] [--symbols a,b]] --from <file\|->` | writes a raw note from a file or stdin; the slug comes from the title (`-2` when taken). A `source` URL (or `pr`) another raw note already has prints that note and exits non-zero. Never overwrites. `--repo-root` stamps provenance: `repo` from origin, `commit` and `ref` of HEAD or of `--rev` (read without checking it out; a sha records no ref), and `paths` (each checked to exist at that commit) and `symbols` |
+| `wiki raw <project>/<topic> --pr <url> [--title "…"] [--source "…"] [--paths a,b] [--symbols a,b] [--repo-root <clone>]` | a GitHub pull request, read through `gh`, as a raw note in place of `--from`: the body is the description, then the discussion as plain text (comments, reviews with a body, inline review comments led by their file path). No author, no names and no bot comments (`[bot]` accounts) are kept. `title` defaults to the PR's title, `source` to its URL, `published` to the merge date (else the creation date). Merged: `commit` is the merge commit, `ref` the base branch; open or closed unmerged: the head commit and branch. `pr` records the URL; `repo` comes from it; `paths` are the changed files the PR did not delete, narrowed by `--paths` (files or folders; one matching nothing is an error). `--repo-root` is optional: given, the commit and each path are checked in the clone; absent, `gh` is trusted. A missing or failing `gh` is an error |
 | `wiki new <project>/<topic>/<slug> --title "…" --type concept\|entity\|synthesis --summary "…" --sources <refs> [--related <refs>] [--aliases "a, b"] [--about "…"]` | scaffolds the note: properties, `# Title`, `## Overview` opening with the summary. A taken slug is an error. A new topic needs `--about`, which writes its folder note. Given only `<topic>/<slug>`, it refuses and names the project its sources come from |
 | `wiki set <note> key=value … [key+=<refs>] [key-=<refs>]` | `=` replaces (a list key takes `<refs>`; `aliases`, `tags`, `paths`, `symbols` take comma-separated text), `+=`/`-=` add to or drop from a list; `updated=today` stamps the date. `disputes` and `supersedes`/`superseded_by` are written on both articles; setting `superseded_by` sets `status=outdated` |
 | `wiki log <learn\|ask\|tend> --subject "…" [--disposition "New; Update"] [--raw <refs>] [--updated <refs>]` | appends one dated entry; a note path in the subject (`Archived: <path>`) becomes its wikilink, other text stays as written |
@@ -312,8 +314,8 @@ read with `sbmap show`, as everywhere.
   without its folder note; a slug taken twice (folder notes aside), or starting with digits and a
   dash; a note anywhere but `wiki/<project>/<topic>/` or `wiki/raw/<project>/<topic>/`; a topic from
   before projects.
-- **Provenance:** a raw note with any of `repo`, `commit`, `ref`, `paths`, `symbols` needs `repo`
-  (`owner/name`) and a full 40-character `commit`; `paths` and `symbols` are lists (`--fix` turns
+- **Provenance:** a raw note with any of `repo`, `commit`, `ref`, `pr`, `paths`, `symbols` needs `repo`
+  (`owner/name`) and a full 40-character `commit`; a `pr` is a GitHub pull request URL; `paths` and `symbols` are lists (`--fix` turns
   comma-separated text into a list); provenance on a note that is not raw, or a `verified` that is
   not a full commit on an article, is an error.
 - **Links:** a markdown link to a vault note (in a wikilink store), or a wikilink by bare file name,
